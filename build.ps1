@@ -99,6 +99,7 @@ if ($Test) {
         'document_tests' = @('document.c')
         'layout_tests'   = @('layout.c')
         'history_tests'  = @('history.c', 'document.c')
+        'search_tests'   = @('search.c')
     }
     foreach ($name in $unitTests.Keys) {
         $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })
