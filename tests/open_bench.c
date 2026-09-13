@@ -21,6 +21,10 @@ static const wchar_t *fileName;
 static HWND shownWindow;
 static double shownAt;
 static double createdAt;
+static double titledAt;
+static double movedAt;
+static double foregroundAt;
+static HWND titledWindow;
 static BOOL goneAgain;
 
 static double Now(void)
@@ -42,11 +46,28 @@ static void CALLBACK OnEvent(HWINEVENTHOOK hook, DWORD event, HWND window, LONG 
     (void)hook;
     (void)thread;
     (void)time;
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        if (window != NULL && window == titledWindow && foregroundAt == 0) {
+            foregroundAt = at;
+        }
+        return;
+    }
     if (window == NULL || object != OBJID_WINDOW || child != CHILDID_SELF || GetAncestor(window, GA_ROOT) != window) {
         return;
     }
 
-    if (event == EVENT_OBJECT_CREATE) {
+    if (event == EVENT_OBJECT_NAMECHANGE) {
+        wchar_t title[512];
+        InternalGetWindowText(window, title, 512);
+        if (titledAt == 0 && wcsstr(title, fileName) != NULL) {
+            titledAt = at;
+            titledWindow = window;
+        }
+    } else if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+        if (window == titledWindow && movedAt == 0) {
+            movedAt = at;
+        }
+    } else if (event == EVENT_OBJECT_CREATE) {
         wchar_t className[64];
         if (createdAt == 0 && GetClassNameW(window, className, 64) > 0 && wcscmp(className, EDITOR_CLASS) == 0) {
             createdAt = at;
@@ -137,6 +158,8 @@ int wmain(int argc, wchar_t **argv)
 
     HWINEVENTHOOK showHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
     HWINEVENTHOOK cloakHook = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    HWINEVENTHOOK nameHook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    HWINEVENTHOOK foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     double total = 0;
     int measured = 0;
@@ -144,6 +167,10 @@ int wmain(int argc, wchar_t **argv)
         shownWindow = NULL;
         goneAgain = FALSE;
         createdAt = 0;
+        titledAt = 0;
+        movedAt = 0;
+        foregroundAt = 0;
+        titledWindow = NULL;
 
         size_t commandLength = wcslen(executable) + wcslen(file) + 8;
         wchar_t *commandLine = malloc(commandLength * sizeof(wchar_t));
@@ -179,6 +206,10 @@ int wmain(int argc, wchar_t **argv)
             } else {
                 wprintf(L"run %d: visible after %.2f ms (%s, launcher still running)\n", run + 1, elapsed, created);
             }
+            if (titledAt != 0) {
+                wprintf(L"        title set %.2f, moved %.2f, foreground %.2f, visible %.2f ms\n", titledAt - started,
+                    movedAt != 0 ? movedAt - started : -1.0, foregroundAt != 0 ? foregroundAt - started : -1.0, elapsed);
+            }
             total += elapsed;
             ++measured;
 
@@ -205,5 +236,7 @@ int wmain(int argc, wchar_t **argv)
     }
     UnhookWinEvent(showHook);
     UnhookWinEvent(cloakHook);
+    UnhookWinEvent(nameHook);
+    UnhookWinEvent(foregroundHook);
     return 0;
 }
