@@ -59,6 +59,7 @@ void SettingsLoad(void)
     settings.poolSize = ReadNumber(L"PoolSize", SETTINGS_POOL_SIZE_DEFAULT, 0, SETTINGS_POOL_SIZE_MAX);
     settings.windowWidth = ReadNumber(L"WindowWidth", 0, 0, 32767);
     settings.windowHeight = ReadNumber(L"WindowHeight", 0, 0, 32767);
+    settings.startupAsked = ReadNumber(L"StartupAsked", 0, 0, 1);
 }
 
 void SettingsSave(void)
@@ -67,4 +68,5 @@ void SettingsSave(void)
     WriteNumber(L"PoolSize", settings.poolSize);
     WriteNumber(L"WindowWidth", settings.windowWidth);
     WriteNumber(L"WindowHeight", settings.windowHeight);
+    WriteNumber(L"StartupAsked", settings.startupAsked);
 }

@@ -70,6 +70,10 @@ BEGIN
     BEGIN
         MENUITEM "&Word Wrap",              IDM_FORMAT_WORD_WRAP
     END
+    POPUP "&Settings"
+    BEGIN
+        MENUITEM "&Start with Windows",     IDM_START_WITH_WINDOWS
+    END
 END
 
 IDD_POOL_SIZE DIALOGEX 0, 0, 236, 74

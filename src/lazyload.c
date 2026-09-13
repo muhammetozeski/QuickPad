@@ -66,6 +66,11 @@ LAZY_POINTER(L"comdlg32.dll", HWND, return, ReplaceTextW, (LPFINDREPLACEW data),
 LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegSetKeyValueW,
     (HKEY key, LPCWSTR subKey, LPCWSTR name, DWORD type, LPCVOID data, DWORD size),
     (key, subKey, name, type, data, size))
+LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegGetValueW,
+    (HKEY key, LPCWSTR subKey, LPCWSTR name, DWORD flags, LPDWORD type, PVOID data, LPDWORD size),
+    (key, subKey, name, flags, type, data, size))
+LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegDeleteKeyValueW, (HKEY key, LPCWSTR subKey, LPCWSTR name),
+    (key, subKey, name))
 
 LAZY_POINTER(L"dwmapi.dll", HRESULT, return, DwmSetWindowAttribute,
     (HWND window, DWORD attribute, LPCVOID data, DWORD size),

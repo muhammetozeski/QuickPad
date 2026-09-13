@@ -8,6 +8,7 @@ typedef struct Settings {
     int poolSize;
     int windowWidth;
     int windowHeight;
+    BOOL startupAsked;
 } Settings;
 
 #define SETTINGS_POOL_SIZE_DEFAULT 30

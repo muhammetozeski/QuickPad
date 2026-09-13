@@ -3,6 +3,7 @@
 #include "quickpad.h"
 #include "resource.h"
 #include "settings.h"
+#include "startup.h"
 #include "theme.h"
 
 #include <shellapi.h>
@@ -93,6 +94,7 @@ static void ShowTrayMenu(int x, int y)
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IDM_TRAY_NEW, L"&New Window");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_POOL_SIZE, L"&Window Pool Size...");
+    AppendMenuW(menu, MF_STRING | (StartupIsEnabled() ? MF_CHECKED : MF_UNCHECKED), IDM_START_WITH_WINDOWS, L"&Start with Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"E&xit");
 
@@ -114,6 +116,9 @@ static void HandleHostCommand(UINT command)
         break;
     case IDM_TRAY_POOL_SIZE:
         DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_POOL_SIZE), NULL, PoolSizeProc, 0);
+        break;
+    case IDM_START_WITH_WINDOWS:
+        StartupToggle(NULL);
         break;
     case IDM_TRAY_EXIT:
         ExitHost();
@@ -257,6 +262,9 @@ int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, 
     }
     if (!resident && EditorShownCount() == 0) {
         return 0;
+    }
+    if (resident) {
+        StartupAskOnce();
     }
 
     /* Pool windows are drawn only while no message waits, so typing and painting never queue behind them. */

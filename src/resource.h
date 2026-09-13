@@ -26,6 +26,8 @@
 
 #define IDM_FORMAT_WORD_WRAP     40030
 
+#define IDM_START_WITH_WINDOWS   40040
+
 #define IDM_TRAY_NEW             40100
 #define IDM_TRAY_EXIT            40101
 #define IDM_TRAY_POOL_SIZE       40102

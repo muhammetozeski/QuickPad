@@ -5,6 +5,7 @@
 #include "quickpad.h"
 #include "resource.h"
 #include "settings.h"
+#include "startup.h"
 #include "strings.h"
 #include "textview.h"
 #include "theme.h"
@@ -587,6 +588,9 @@ static void UpdateMenu(Editor *editor, HMENU menu)
     EnableMenuItem(menu, IDM_EDIT_DELETE, selection);
     EnableMenuItem(menu, IDM_EDIT_PASTE, TextViewCanPaste(editor->view) ? MF_ENABLED : MF_GRAYED);
     CheckMenuItem(menu, IDM_FORMAT_WORD_WRAP, settings.wordWrap ? MF_CHECKED : MF_UNCHECKED);
+    if (GetMenuState(menu, IDM_START_WITH_WINDOWS, MF_BYCOMMAND) != (UINT)-1) {
+        CheckMenuItem(menu, IDM_START_WITH_WINDOWS, StartupIsEnabled() ? MF_CHECKED : MF_UNCHECKED);
+    }
 }
 
 static void ToggleWordWrap(void)
@@ -787,6 +791,9 @@ static void HandleCommand(Editor *editor, int command)
         break;
     case IDM_FORMAT_WORD_WRAP:
         ToggleWordWrap();
+        break;
+    case IDM_START_WITH_WINDOWS:
+        StartupToggle(editor->window);
         break;
     }
 }
