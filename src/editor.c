@@ -5,6 +5,7 @@
 #include "quickpad.h"
 #include "resource.h"
 #include "settings.h"
+#include "strings.h"
 #include "textview.h"
 #include "theme.h"
 
@@ -56,42 +57,6 @@ static BOOL residentProcess;
 
 /* ---- Small helpers ------------------------------------------------------------------------- */
 
-static wchar_t *CopyString(const wchar_t *text)
-{
-    size_t length = (size_t)lstrlenW(text);
-    wchar_t *copy = MemAlloc((length + 1) * sizeof(wchar_t));
-    if (copy != NULL) {
-        memcpy(copy, text, (length + 1) * sizeof(wchar_t));
-    }
-    return copy;
-}
-
-/* Joins up to three strings into a MemAlloc block. */
-static wchar_t *Concat(const wchar_t *first, const wchar_t *second, const wchar_t *third)
-{
-    size_t a = (size_t)lstrlenW(first);
-    size_t b = (size_t)lstrlenW(second);
-    size_t c = (size_t)lstrlenW(third);
-    wchar_t *joined = MemAlloc((a + b + c + 1) * sizeof(wchar_t));
-    if (joined != NULL) {
-        memcpy(joined, first, a * sizeof(wchar_t));
-        memcpy(joined + a, second, b * sizeof(wchar_t));
-        memcpy(joined + a + b, third, (c + 1) * sizeof(wchar_t));
-    }
-    return joined;
-}
-
-static const wchar_t *FileName(const wchar_t *path)
-{
-    const wchar_t *name = path;
-    for (const wchar_t *p = path; *p != 0; ++p) {
-        if (*p == L'\\' || *p == L'/') {
-            name = p + 1;
-        }
-    }
-    return name;
-}
-
 static HWND DialogOwner(const Editor *editor)
 {
     return editor != NULL && editor->shown ? editor->window : NULL;
@@ -102,7 +67,7 @@ static void ShowFileError(const Editor *editor, const wchar_t *path, DWORD error
     wchar_t *system = NULL;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         NULL, error, 0, (LPWSTR)&system, 0, NULL);
-    wchar_t *message = Concat(path, L"\n\n", system != NULL ? system : L"");
+    wchar_t *message = StringJoin(path, L"\n\n", system != NULL ? system : L"");
     MessageBoxW(DialogOwner(editor), message != NULL ? message : path, QP_APP_NAME, MB_ICONERROR);
     MemFree(message);
     if (system != NULL) {
@@ -113,7 +78,7 @@ static void ShowFileError(const Editor *editor, const wchar_t *path, DWORD error
 static void UpdateTitle(Editor *editor)
 {
     BOOL modified = TextViewIsModified(editor->view);
-    wchar_t *title = Concat(modified ? L"*" : L"", editor->path != NULL ? FileName(editor->path) : L"Untitled",
+    wchar_t *title = StringJoin(modified ? L"*" : L"", editor->path != NULL ? PathFileName(editor->path) : L"Untitled",
         L" - " QP_APP_NAME);
     if (title != NULL) {
         SetWindowTextW(editor->window, title);
@@ -125,7 +90,7 @@ static void UpdateTitle(Editor *editor)
 static void SetPath(Editor *editor, const wchar_t *path)
 {
     MemFree(editor->path);
-    editor->path = path != NULL ? CopyString(path) : NULL;
+    editor->path = path != NULL ? StringCopy(path) : NULL;
 }
 
 static BOOL EnsureCom(void)
@@ -344,7 +309,7 @@ static BOOL LoadInto(Editor *editor, const wchar_t *path)
             ShowFileError(editor, path, error);
             return FALSE;
         }
-        wchar_t *question = Concat(L"Cannot find the file\n", path, L"\n\nDo you want to create a new file?");
+        wchar_t *question = StringJoin(L"Cannot find the file\n", path, L"\n\nDo you want to create a new file?");
         int answer = MessageBoxW(DialogOwner(editor), question != NULL ? question : path, QP_APP_NAME,
             MB_YESNO | MB_ICONQUESTION);
         MemFree(question);
@@ -506,9 +471,9 @@ static BOOL SaveAs(Editor *editor)
     IFileSaveDialog_SetOptions(dialog, options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOREADONLYRETURN);
 
     if (editor->path != NULL) {
-        wchar_t *folder = CopyString(editor->path);
+        wchar_t *folder = StringCopy(editor->path);
         if (folder != NULL) {
-            wchar_t *name = (wchar_t *)FileName(folder);
+            wchar_t *name = (wchar_t *)PathFileName(folder);
             if (name > folder) {
                 name[-1] = 0;
                 IShellItem *folderItem = NULL;
@@ -519,7 +484,7 @@ static BOOL SaveAs(Editor *editor)
             }
             MemFree(folder);
         }
-        IFileSaveDialog_SetFileName(dialog, FileName(editor->path));
+        IFileSaveDialog_SetFileName(dialog, PathFileName(editor->path));
     } else {
         IFileSaveDialog_SetFileName(dialog, L"Untitled.txt");
     }
@@ -568,7 +533,7 @@ static BOOL ConfirmDiscard(Editor *editor)
         return TRUE;
     }
     SetForegroundWindow(editor->window);
-    wchar_t *question = Concat(L"Do you want to save changes to ", editor->path != NULL ? editor->path : L"Untitled", L"?");
+    wchar_t *question = StringJoin(L"Do you want to save changes to ", editor->path != NULL ? editor->path : L"Untitled", L"?");
     int answer = MessageBoxW(editor->window, question != NULL ? question : L"Do you want to save changes?", QP_APP_NAME,
         MB_YESNOCANCEL | MB_ICONWARNING);
     MemFree(question);

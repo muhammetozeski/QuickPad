@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "quickpad.h"
+#include "strings.h"
 
 #define SECTION L"QuickPad"
 
@@ -13,28 +14,26 @@ static const wchar_t *IniPath(void)
     if (iniPath != NULL) {
         return iniPath;
     }
-    for (DWORD capacity = MAX_PATH; capacity <= 32768; capacity *= 2) {
-        wchar_t *path = MemAlloc((capacity + 4) * sizeof(wchar_t));
-        if (path == NULL) {
-            return NULL;
-        }
-        DWORD length = GetModuleFileNameW(NULL, path, capacity);
-        if (length > 0 && length < capacity) {
-            DWORD dot = length;
-            while (dot > 0 && path[dot - 1] != L'.' && path[dot - 1] != L'\\') {
-                --dot;
-            }
-            DWORD end = dot > 0 && path[dot - 1] == L'.' ? dot - 1 : length;
-            memcpy(path + end, L".ini", 5 * sizeof(wchar_t));
-            iniPath = path;
-            return iniPath;
-        }
-        MemFree(path);
-        if (length == 0) {
-            return NULL;
+    wchar_t *path = PathOfExecutable();
+    if (path == NULL) {
+        return NULL;
+    }
+    size_t length = (size_t)lstrlenW(path);
+    const wchar_t *name = PathFileName(path);
+    size_t end = length;
+    for (size_t i = length; i > (size_t)(name - path); --i) {
+        if (path[i - 1] == L'.') {
+            end = i - 1;
+            break;
         }
     }
-    return NULL;
+    iniPath = MemAlloc((end + 5) * sizeof(wchar_t));
+    if (iniPath != NULL) {
+        memcpy(iniPath, path, end * sizeof(wchar_t));
+        memcpy(iniPath + end, L".ini", 5 * sizeof(wchar_t));
+    }
+    MemFree(path);
+    return iniPath;
 }
 
 static int ReadNumber(const wchar_t *key, int fallback, int minimum, int maximum)
