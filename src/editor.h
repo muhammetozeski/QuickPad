@@ -12,6 +12,15 @@ void EditorSetResident(BOOL resident);
 BOOL EditorOpenFile(const wchar_t *path);
 BOOL EditorOpenNew(void);
 
+/*
+ * Keeps the pool of drawn, cloaked editor windows at its size, one window per call. Call it when the
+ * message queue is empty; it returns FALSE when there was nothing to do.
+ */
+BOOL EditorIdle(void);
+
+int EditorPoolSize(void);
+void EditorSetPoolSize(int size);
+
 /* Closes every window, offering to save changes first; FALSE when the user cancels. */
 BOOL EditorCloseAll(void);
 

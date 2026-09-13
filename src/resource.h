@@ -21,3 +21,11 @@
 
 #define IDM_TRAY_NEW             40100
 #define IDM_TRAY_EXIT            40101
+#define IDM_TRAY_POOL_SIZE       40102
+
+#define IDD_POOL_SIZE            200
+#define IDC_POOL_SIZE            1001
+
+#ifndef IDC_STATIC
+#define IDC_STATIC               (-1)
+#endif

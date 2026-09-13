@@ -2,6 +2,8 @@
 #include "editor.h"
 #include "quickpad.h"
 #include "resource.h"
+#include "settings.h"
+#include "theme.h"
 
 #include <shellapi.h>
 #include <windowsx.h>
@@ -47,10 +49,50 @@ static void ExitHost(void)
     DestroyWindow(hostWindow);
 }
 
+static INT_PTR CALLBACK PoolSizeProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    INT_PTR themed = 0;
+    if (ThemeDialogMessage(dialog, message, wParam, lParam, &themed)) {
+        return themed;
+    }
+
+    switch (message) {
+    case WM_INITDIALOG:
+        ThemePrepareDialog(dialog);
+        SendDlgItemMessageW(dialog, IDC_POOL_SIZE, EM_LIMITTEXT, 3, 0);
+        SetDlgItemInt(dialog, IDC_POOL_SIZE, (UINT)EditorPoolSize(), FALSE);
+        SetForegroundWindow(dialog);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            BOOL valid = FALSE;
+            UINT size = GetDlgItemInt(dialog, IDC_POOL_SIZE, &valid, FALSE);
+            if (!valid || size > SETTINGS_POOL_SIZE_MAX) {
+                MessageBeep(MB_ICONWARNING);
+                HWND edit = GetDlgItem(dialog, IDC_POOL_SIZE);
+                SetFocus(edit);
+                SendMessageW(edit, EM_SETSEL, 0, -1);
+                return TRUE;
+            }
+            EditorSetPoolSize((int)size);
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
 static void ShowTrayMenu(int x, int y)
 {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IDM_TRAY_NEW, L"&New Window");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_POOL_SIZE, L"&Window Pool Size...");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"E&xit");
 
@@ -59,11 +101,23 @@ static void ShowTrayMenu(int x, int y)
     UINT command = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, hostWindow, NULL);
     PostMessageW(hostWindow, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    if (command != 0) {
+        PostMessageW(hostWindow, WM_COMMAND, command, 0);
+    }
+}
 
-    if (command == IDM_TRAY_NEW) {
+static void HandleHostCommand(UINT command)
+{
+    switch (command) {
+    case IDM_TRAY_NEW:
         EditorOpenNew();
-    } else if (command == IDM_TRAY_EXIT) {
+        break;
+    case IDM_TRAY_POOL_SIZE:
+        DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_POOL_SIZE), NULL, PoolSizeProc, 0);
+        break;
+    case IDM_TRAY_EXIT:
         ExitHost();
+        break;
     }
 }
 
@@ -114,6 +168,10 @@ static LRESULT CALLBACK HostProc(HWND window, UINT message, WPARAM wParam, LPARA
             ShowTrayMenu(GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam));
             break;
         }
+        return 0;
+
+    case WM_COMMAND:
+        HandleHostCommand(LOWORD(wParam));
         return 0;
 
     case WM_CLOSE:
@@ -182,12 +240,20 @@ int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, 
         return 0;
     }
 
-    MSG message;
-    while (GetMessageW(&message, NULL, 0, 0) > 0) {
-        if (!EditorTranslateMessage(&message)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+    /* Pool windows are drawn only while no message waits, so typing and painting never queue behind them. */
+    for (;;) {
+        MSG message;
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                return (int)message.wParam;
+            }
+            if (!EditorTranslateMessage(&message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (!EditorIdle()) {
+            WaitMessage();
         }
     }
-    return (int)message.wParam;
 }

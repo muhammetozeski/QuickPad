@@ -10,6 +10,9 @@
 #define MENU_TEXT_COLOR RGB(230, 230, 230)
 #define MENU_INACTIVE_TEXT_COLOR RGB(170, 170, 170)
 #define MENU_DISABLED_TEXT_COLOR RGB(120, 120, 120)
+#define DIALOG_COLOR RGB(32, 32, 32)
+#define DIALOG_TEXT_COLOR RGB(230, 230, 230)
+#define EDIT_COLOR RGB(45, 45, 45)
 
 /*
  * Windows draws the menu bar itself and has no dark version of it. It sends these undocumented
@@ -63,16 +66,25 @@ static const TextViewColors darkText = {
 static HBRUSH menuBarBrush;
 static HBRUSH menuHotBrush;
 static HBRUSH menuPressedBrush;
+static HBRUSH dialogBrush;
+static HBRUSH editBrush;
+static BOOL (WINAPI *allowDarkModeForWindow)(HWND, BOOL);
 
 void ThemeInitialize(void)
 {
     menuBarBrush = CreateSolidBrush(MENU_BAR_COLOR);
     menuHotBrush = CreateSolidBrush(MENU_HOT_COLOR);
     menuPressedBrush = CreateSolidBrush(MENU_PRESSED_COLOR);
+    dialogBrush = CreateSolidBrush(DIALOG_COLOR);
+    editBrush = CreateSolidBrush(EDIT_COLOR);
 
-    /* Popup menus follow the app mode set through undocumented uxtheme exports 135 and 136. */
+    /*
+     * Popup menus follow the app mode set through undocumented uxtheme exports 135 and 136;
+     * export 133 lets a single control use its dark theme.
+     */
     HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (uxtheme != NULL) {
+        allowDarkModeForWindow = (BOOL (WINAPI *)(HWND, BOOL))GetProcAddress(uxtheme, MAKEINTRESOURCEA(133));
         int (WINAPI *setPreferredAppMode)(int) = (int (WINAPI *)(int))GetProcAddress(uxtheme, MAKEINTRESOURCEA(135));
         void (WINAPI *flushMenuThemes)(void) = (void (WINAPI *)(void))GetProcAddress(uxtheme, MAKEINTRESOURCEA(136));
         if (setPreferredAppMode != NULL) {
@@ -99,6 +111,54 @@ void ThemePrepareScrollBars(HWND window)
 const TextViewColors *ThemeTextColors(void)
 {
     return &darkText;
+}
+
+static BOOL CALLBACK ThemeDialogControl(HWND control, LPARAM unused)
+{
+    UNREFERENCED_PARAMETER(unused);
+    wchar_t className[32];
+    if (GetClassNameW(control, className, ARRAYSIZE(className)) > 0) {
+        const wchar_t *theme = CompareStringOrdinal(className, -1, L"Button", -1, TRUE) == CSTR_EQUAL ? L"DarkMode_Explorer"
+            : CompareStringOrdinal(className, -1, L"Edit", -1, TRUE) == CSTR_EQUAL ? L"DarkMode_CFD"
+            : NULL;
+        if (theme != NULL) {
+            if (allowDarkModeForWindow != NULL) {
+                allowDarkModeForWindow(control, TRUE);
+            }
+            SetWindowTheme(control, theme, NULL);
+            SendMessageW(control, WM_THEMECHANGED, 0, 0);
+        }
+    }
+    return TRUE;
+}
+
+void ThemePrepareDialog(HWND dialog)
+{
+    ThemePrepareWindow(dialog);
+    EnumChildWindows(dialog, ThemeDialogControl, 0);
+}
+
+BOOL ThemeDialogMessage(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam, INT_PTR *result)
+{
+    UNREFERENCED_PARAMETER(dialog);
+    UNREFERENCED_PARAMETER(lParam);
+    switch (message) {
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORBTN:
+        *result = (INT_PTR)dialogBrush;
+        return TRUE;
+    case WM_CTLCOLORSTATIC:
+        SetTextColor((HDC)wParam, DIALOG_TEXT_COLOR);
+        SetBkColor((HDC)wParam, DIALOG_COLOR);
+        *result = (INT_PTR)dialogBrush;
+        return TRUE;
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wParam, DIALOG_TEXT_COLOR);
+        SetBkColor((HDC)wParam, EDIT_COLOR);
+        *result = (INT_PTR)editBrush;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* Covers the light line Windows draws between the menu bar and the client area. */

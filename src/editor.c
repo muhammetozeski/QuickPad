@@ -8,12 +8,16 @@
 #include "textview.h"
 #include "theme.h"
 
+#include <dwmapi.h>
 #include <shobjidl.h>
 
 #define EDITOR_CLASS L"QuickPadEditor"
 #define VIEW_ID 1
 #define ENCODING_GROUP 100
 #define ENCODING_COMBO 101
+
+/* Windows waiting in the pool sit here, cloaked, so they never cover anything or take input. */
+#define PARK_POSITION (-32000)
 
 enum EncodingChoice {
     CHOICE_UTF8,
@@ -39,6 +43,7 @@ typedef struct Editor {
     TextFormat format;
     BOOL modifiedShown;
     BOOL shown;
+    BOOL pooled;
 } Editor;
 
 static HINSTANCE instanceHandle;
@@ -89,7 +94,7 @@ static const wchar_t *FileName(const wchar_t *path)
 
 static HWND DialogOwner(const Editor *editor)
 {
-    return editor != NULL && IsWindowVisible(editor->window) ? editor->window : NULL;
+    return editor != NULL && editor->shown ? editor->window : NULL;
 }
 
 static void ShowFileError(const Editor *editor, const wchar_t *path, DWORD error)
@@ -143,6 +148,99 @@ static Editor *FindByPath(const wchar_t *path)
     return NULL;
 }
 
+static void SetCloaked(HWND window, BOOL cloaked)
+{
+    DwmSetWindowAttribute(window, DWMWA_CLOAK, &cloaked, sizeof cloaked);
+}
+
+/* The taskbar lists cloaked windows too, so pooled windows have their buttons removed through this. */
+static ITaskbarList *Taskbar(void)
+{
+    static ITaskbarList *taskbar;
+    if (taskbar == NULL && EnsureCom()
+        && SUCCEEDED(CoCreateInstance(&CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, &IID_ITaskbarList, (void **)&taskbar))
+        && FAILED(ITaskbarList_HrInit(taskbar))) {
+        ITaskbarList_Release(taskbar);
+        taskbar = NULL;
+    }
+    return taskbar;
+}
+
+static void SetTaskbarButton(HWND window, BOOL present)
+{
+    ITaskbarList *taskbar = Taskbar();
+    if (taskbar != NULL) {
+        if (present) {
+            ITaskbarList_AddTab(taskbar, window);
+        } else {
+            ITaskbarList_DeleteTab(taskbar, window);
+        }
+    }
+}
+
+static int PoolCount(void)
+{
+    int count = 0;
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        count += editor->pooled;
+    }
+    return count;
+}
+
+static RECT WorkArea(void)
+{
+    POINT cursor = { 0, 0 };
+    GetCursorPos(&cursor);
+    MONITORINFO info = { sizeof info };
+    GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &info);
+    return info.rcWork;
+}
+
+static SIZE WindowSize(const RECT *work)
+{
+    SIZE size;
+    int workWidth = work->right - work->left;
+    int workHeight = work->bottom - work->top;
+    size.cx = settings.windowWidth > 0 ? settings.windowWidth : workWidth * 3 / 5;
+    size.cy = settings.windowHeight > 0 ? settings.windowHeight : workHeight * 2 / 3;
+    size.cx = size.cx < workWidth ? size.cx : workWidth;
+    size.cy = size.cy < workHeight ? size.cy : workHeight;
+    return size;
+}
+
+/* Centered on the monitor under the mouse, each further window a caption height lower and to the right. */
+static RECT NewWindowFrame(void)
+{
+    RECT work = WorkArea();
+    SIZE size = WindowSize(&work);
+    int step = GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+    int offset = (EditorShownCount() % 8) * step;
+    int left = work.left + (work.right - work.left - size.cx) / 2 + offset;
+    int top = work.top + (work.bottom - work.top - size.cy) / 2 + offset;
+    left = left + size.cx > work.right ? work.right - size.cx : left;
+    top = top + size.cy > work.bottom ? work.bottom - size.cy : top;
+    left = left < work.left ? work.left : left;
+    top = top < work.top ? work.top : top;
+    RECT frame = { left, top, left + size.cx, top + size.cy };
+    return frame;
+}
+
+/* Shows an editor off screen without activating it, still cloaked, and draws it so it is ready to appear. */
+static void ParkEditor(Editor *editor)
+{
+    RECT work = WorkArea();
+    SIZE size = WindowSize(&work);
+    WINDOWPLACEMENT placement = { sizeof placement };
+    GetWindowPlacement(editor->window, &placement);
+    placement.flags = 0;
+    placement.showCmd = SW_SHOWNOACTIVATE;
+    SetRect(&placement.rcNormalPosition, PARK_POSITION, PARK_POSITION, PARK_POSITION + size.cx, PARK_POSITION + size.cy);
+    SetWindowPlacement(editor->window, &placement);
+    SetTaskbarButton(editor->window, FALSE);
+    RedrawWindow(editor->window, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    editor->pooled = TRUE;
+}
+
 static Editor *CreateEditor(void)
 {
     Editor *editor = MemAllocZero(sizeof *editor);
@@ -151,9 +249,11 @@ static Editor *CreateEditor(void)
     }
     editor->format = TextDefaultFormat();
 
+    RECT work = WorkArea();
+    SIZE size = WindowSize(&work);
     HMENU menu = LoadMenuW(instanceHandle, MAKEINTRESOURCEW(IDR_MENU));
     HWND window = CreateWindowExW(0, EDITOR_CLASS, L"Untitled - " QP_APP_NAME, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, NULL, menu, instanceHandle, editor);
+        PARK_POSITION, PARK_POSITION, size.cx, size.cy, NULL, menu, instanceHandle, editor);
     if (window == NULL) {
         if (menu != NULL) {
             DestroyMenu(menu);
@@ -163,20 +263,72 @@ static Editor *CreateEditor(void)
     }
     editor->next = editors;
     editors = editor;
+    SetCloaked(window, TRUE);
+    ParkEditor(editor);
     return editor;
+}
+
+/* A drawn editor from the pool, or a new one when the pool is empty. */
+static Editor *TakeEditor(void)
+{
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        if (editor->pooled) {
+            return editor;
+        }
+    }
+    return CreateEditor();
 }
 
 static void ShowEditor(Editor *editor)
 {
+    HWND window = editor->window;
+    if (editor->shown) {
+        if (IsIconic(window)) {
+            ShowWindow(window, SW_RESTORE);
+        }
+        SetForegroundWindow(window);
+        return;
+    }
+
+    /* Everything happens while the window is still cloaked, so it appears complete in one frame. */
+    RECT frame = NewWindowFrame();
+    editor->pooled = FALSE;
     editor->shown = TRUE;
-    ShowWindow(editor->window, IsIconic(editor->window) ? SW_RESTORE : SW_SHOW);
-    SetForegroundWindow(editor->window);
-    RedrawWindow(editor->window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    SetWindowPos(window, HWND_TOP, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, SWP_NOACTIVATE);
+    RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    SetCloaked(window, FALSE);
+    SetForegroundWindow(window);
+    SetTaskbarButton(window, TRUE);
 }
 
+/* Returns a closed editor to the pool, or destroys it when the pool is full. */
 static void CloseEditor(Editor *editor)
 {
-    DestroyWindow(editor->window);
+    HWND window = editor->window;
+    WINDOWPLACEMENT placement = { sizeof placement };
+    if (editor->shown && GetWindowPlacement(window, &placement)) {
+        int width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+        int height = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+        if (width != settings.windowWidth || height != settings.windowHeight) {
+            settings.windowWidth = width;
+            settings.windowHeight = height;
+            SettingsSave();
+        }
+    }
+
+    editor->shown = FALSE;
+    if (!residentProcess || PoolCount() >= settings.poolSize) {
+        DestroyWindow(window);
+        return;
+    }
+
+    SetCloaked(window, TRUE);
+    ShowWindow(window, SW_HIDE);
+    TextViewClear(editor->view);
+    SetPath(editor, NULL);
+    editor->format = TextDefaultFormat();
+    UpdateTitle(editor);
+    ParkEditor(editor);
 }
 
 /* Loads a file into an editor. A missing file can become a new, empty document with that name. */
@@ -514,7 +666,10 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
     }
 
     switch (message) {
-    case WM_CREATE:
+    case WM_CREATE: {
+        /* Windows animates windows as they appear; editors appear at once instead. */
+        BOOL disableTransitions = TRUE;
+        DwmSetWindowAttribute(window, DWMWA_TRANSITIONS_FORCEDISABLED, &disableTransitions, sizeof disableTransitions);
         ThemePrepareWindow(window);
         editor->view = TextViewCreate(window, VIEW_ID, instanceHandle);
         if (editor->view == NULL) {
@@ -525,6 +680,7 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         TextViewSetFont(editor->view, editorFont);
         TextViewSetWordWrap(editor->view, settings.wordWrap);
         return 0;
+    }
 
     case WM_SIZE:
         MoveWindow(editor->view, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
@@ -578,6 +734,31 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+/* Draws the characters most text uses once, so GDI has their glyphs cached before the first file opens. */
+static void WarmGlyphCache(void)
+{
+    wchar_t sample[128];
+    int length = 0;
+    for (wchar_t ch = 0x20; ch < 0x7F; ++ch) {
+        sample[length++] = ch;
+    }
+    for (const wchar_t *extra = L"\x00E7\x011F\x0131\x00F6\x015F\x00FC\x00C7\x011E\x0130\x00D6\x015E\x00DC"; *extra != 0; ++extra) {
+        sample[length++] = *extra;
+    }
+
+    HDC screen = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, 16, 16);
+    ReleaseDC(NULL, screen);
+    HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
+    HGDIOBJ previousFont = SelectObject(dc, editorFont);
+    ExtTextOutW(dc, 0, 0, 0, NULL, sample, (UINT)length, NULL);
+    SelectObject(dc, previousFont);
+    SelectObject(dc, previousBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
 /* ---- Public functions ---------------------------------------------------------------------- */
 
 BOOL EditorInitialize(HINSTANCE instance)
@@ -606,7 +787,11 @@ BOOL EditorInitialize(HINSTANCE instance)
     ReleaseDC(NULL, screen);
     editorFont = CreateFontW(-MulDiv(11, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-    return editorFont != NULL;
+    if (editorFont == NULL) {
+        return FALSE;
+    }
+    WarmGlyphCache();
+    return TRUE;
 }
 
 BOOL EditorOpenFile(const wchar_t *path)
@@ -617,12 +802,9 @@ BOOL EditorOpenFile(const wchar_t *path)
         return TRUE;
     }
 
-    Editor *editor = CreateEditor();
-    if (editor == NULL) {
-        return FALSE;
-    }
-    if (!LoadInto(editor, path)) {
-        CloseEditor(editor);
+    /* A pooled editor that fails to load stays in the pool. */
+    Editor *editor = TakeEditor();
+    if (editor == NULL || !LoadInto(editor, path)) {
         return FALSE;
     }
     ShowEditor(editor);
@@ -631,12 +813,40 @@ BOOL EditorOpenFile(const wchar_t *path)
 
 BOOL EditorOpenNew(void)
 {
-    Editor *editor = CreateEditor();
+    Editor *editor = TakeEditor();
     if (editor == NULL) {
         return FALSE;
     }
     ShowEditor(editor);
     return TRUE;
+}
+
+BOOL EditorIdle(void)
+{
+    if (!residentProcess) {
+        return FALSE;
+    }
+    int pooled = PoolCount();
+    if (pooled > settings.poolSize) {
+        for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+            if (editor->pooled) {
+                DestroyWindow(editor->window);
+                return TRUE;
+            }
+        }
+    }
+    return pooled < settings.poolSize && CreateEditor() != NULL;
+}
+
+int EditorPoolSize(void)
+{
+    return settings.poolSize;
+}
+
+void EditorSetPoolSize(int size)
+{
+    settings.poolSize = size < 0 ? 0 : size > SETTINGS_POOL_SIZE_MAX ? SETTINGS_POOL_SIZE_MAX : size;
+    SettingsSave();
 }
 
 void EditorSetResident(BOOL resident)
