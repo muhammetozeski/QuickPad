@@ -14,6 +14,7 @@
 #include <imm.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
 
@@ -58,6 +59,10 @@ LAZY_POINTER(L"ole32.dll", HRESULT, return, CoCreateInstance,
     (classId, outer, context, interfaceId, object))
 LAZY_POINTER(L"ole32.dll", void, , CoTaskMemFree, (LPVOID block), (block))
 
+LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegSetKeyValueW,
+    (HKEY key, LPCWSTR subKey, LPCWSTR name, DWORD type, LPCVOID data, DWORD size),
+    (key, subKey, name, type, data, size))
+
 LAZY_POINTER(L"dwmapi.dll", HRESULT, return, DwmSetWindowAttribute,
     (HWND window, DWORD attribute, LPCVOID data, DWORD size),
     (window, attribute, data, size))
@@ -67,6 +72,8 @@ LAZY_POINTER(L"uxtheme.dll", HRESULT, return, SetWindowTheme,
     (window, application, list))
 
 LAZY_POINTER(L"shell32.dll", BOOL, return, Shell_NotifyIconW, (DWORD message, PNOTIFYICONDATAW data), (message, data))
+LAZY_POINTER(L"shell32.dll", void, , SHChangeNotify, (LONG eventId, UINT flags, LPCVOID first, LPCVOID second),
+    (eventId, flags, first, second))
 
 LAZY_POINTER(L"shell32.dll", HRESULT, return, SHCreateItemFromParsingName,
     (PCWSTR path, IBindCtx *context, REFIID interfaceId, void **item),

@@ -8,7 +8,6 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
-#define WM_HOST_OPEN (WM_APP + 1)
 #define WM_HOST_TRAY (WM_APP + 2)
 #define TRAY_ICON_ID 1
 #define MAX_PATH_BYTES (32768 * sizeof(wchar_t))

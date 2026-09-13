@@ -1,5 +1,6 @@
 #include "host.h"
 #include "quickpad.h"
+#include "register.h"
 
 static const wchar_t *SkipProgramName(const wchar_t *cursor)
 {
@@ -137,6 +138,9 @@ static int QuickPadMain(void)
     size_t count = 0;
     BOOL background = FALSE;
     for (wchar_t *argument = NextArgument(&commandLine); argument != NULL; argument = NextArgument(&commandLine)) {
+        if (CompareStringOrdinal(argument, -1, L"--register", -1, TRUE) == CSTR_EQUAL) {
+            return RegisterFileTypes();
+        }
         if (CompareStringOrdinal(argument, -1, L"--background", -1, TRUE) == CSTR_EQUAL) {
             background = TRUE;
         } else {

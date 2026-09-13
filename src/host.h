@@ -10,6 +10,9 @@
 #define HOST_COPY_OPEN 0x51500001 /* lpData: a null-terminated full path */
 #define HOST_COPY_NEW 0x51500002  /* opens an empty window */
 
+/* Posted to the host window: lParam is a MemAlloc full path the host opens and frees, or NULL for an empty window. */
+#define WM_HOST_OPEN (WM_APP + 1)
+
 /*
  * Runs the editor in this process. A resident host keeps running after its last window closes,
  * shows a notification area icon and receives the files of later launches; readyEvent is set once

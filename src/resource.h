@@ -26,6 +26,8 @@
 #define IDD_POOL_SIZE            200
 #define IDC_POOL_SIZE            1001
 
+#define IDR_SHELL_EXTENSION      300
+
 #ifndef IDC_STATIC
 #define IDC_STATIC               (-1)
 #endif

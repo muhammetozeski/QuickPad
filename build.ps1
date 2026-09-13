@@ -75,7 +75,23 @@ $helperSources = $sources | Where-Object { (Split-Path $_ -Leaf) -eq 'nocrt.c' }
 $programSources = $sources | Where-Object { (Split-Path $_ -Leaf) -ne 'nocrt.c' }
 Invoke-Tool cl.exe ($compilerFlags + '/GL' + $programSources)
 Invoke-Tool cl.exe ($compilerFlags + $helperSources)
-Invoke-Tool rc.exe @('/nologo', '/fo', "$obj\QuickPad.res", "$root\res\QuickPad.rc")
+
+# QuickPadShell.dll runs inside Explorer and is embedded in QuickPad.exe, so it is built first.
+$shellObj = Join-Path $obj 'shell'
+New-Item -ItemType Directory -Force $shellObj | Out-Null
+$shellFlags = @(
+    '/nologo', '/c', '/W4', '/WX', '/std:c17', '/utf-8', '/O1', '/Oi', '/GS-', '/Zl', '/Zi',
+    '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', "/Fo$shellObj\", "/Fd$shellObj\QuickPadShell-compile.pdb"
+)
+Invoke-Tool cl.exe ($shellFlags + @("$root\shell\QuickPadShell.c", "$root\src\nocrt.c"))
+Invoke-Tool link.exe @(
+    '/nologo', '/DLL', '/NOENTRY', '/NODEFAULTLIB', "/DEF:$root\shell\QuickPadShell.def",
+    '/OPT:REF', '/OPT:ICF', '/INCREMENTAL:NO', '/DEBUG', "/PDB:$shellObj\QuickPadShell.pdb", '/PDBALTPATH:%_PDB%',
+    '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', "/IMPLIB:$shellObj\QuickPadShell.lib", "/OUT:$bin\QuickPadShell.dll",
+    "$shellObj\QuickPadShell.obj", "$shellObj\nocrt.obj", 'kernel32.lib', 'user32.lib', 'ole32.lib', 'uuid.lib', 'ntdll.lib'
+)
+
+Invoke-Tool rc.exe @('/nologo', '/i', $bin, '/fo', "$obj\QuickPad.res", "$root\res\QuickPad.rc")
 
 $linkerFlags = @(
     '/nologo', '/NODEFAULTLIB', '/ENTRY:QuickPadEntry', '/SUBSYSTEM:WINDOWS',
@@ -117,7 +133,7 @@ if ($Test) {
 
     # Development tools that are built but not run here.
     foreach ($name in @('snapshot', 'command', 'open_bench')) {
-        Invoke-Tool cl.exe ($testFlags + @("$root\tests\$name.c", "/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib', 'dwmapi.lib'))
+        Invoke-Tool cl.exe ($testFlags + @("$root\tests\$name.c", "/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib', 'dwmapi.lib', 'shell32.lib', 'ole32.lib', 'uuid.lib'))
     }
 
     foreach ($name in $unitTests.Keys) {

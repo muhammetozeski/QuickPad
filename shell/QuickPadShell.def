@@ -1,0 +1,4 @@
+LIBRARY QuickPadShell
+EXPORTS
+    DllGetClassObject = ShellGetClassObject PRIVATE
+    DllCanUnloadNow = ShellCanUnloadNow PRIVATE

@@ -3,6 +3,9 @@
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
+/* Built before this script and found through the include path build.ps1 passes. */
+IDR_SHELL_EXTENSION RCDATA "QuickPadShell.dll"
+
 IDR_MENU MENU
 BEGIN
     POPUP "&File"
