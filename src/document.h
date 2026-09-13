@@ -33,6 +33,9 @@ size_t DocumentLength(const Document *document);
 wchar_t DocumentCharAt(const Document *document, size_t position);
 void DocumentCopy(const Document *document, size_t start, size_t count, wchar_t *destination);
 
+/* Pointer to text[start, start + count) when the range does not cross the gap, otherwise NULL. */
+const wchar_t *DocumentPeek(const Document *document, size_t start, size_t count);
+
 /* Moves the gap to the end and returns the whole text, null-terminated. */
 const wchar_t *DocumentText(Document *document);
 

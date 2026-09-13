@@ -176,6 +176,17 @@ void DocumentCopy(const Document *document, size_t start, size_t count, wchar_t 
     }
 }
 
+const wchar_t *DocumentPeek(const Document *document, size_t start, size_t count)
+{
+    if (start + count <= document->gapStart) {
+        return document->buffer + start;
+    }
+    if (start >= document->gapStart) {
+        return document->buffer + start + GapSize(document);
+    }
+    return NULL;
+}
+
 static void MoveGap(Document *document, size_t position)
 {
     size_t gap = GapSize(document);

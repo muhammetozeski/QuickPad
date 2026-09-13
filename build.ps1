@@ -65,11 +65,16 @@ $objects = $sources | ForEach-Object { Join-Path $obj ([IO.Path]::GetFileNameWit
 
 $compilerFlags = @(
     '/nologo', '/c', '/W4', '/WX', '/std:c17', '/utf-8',
-    '/O2', '/Oi', '/GL', '/GS-', '/Gs1000000', '/Zl', '/Zi',
+    '/O2', '/Oi', '/GS-', '/Gs1000000', '/Zl', '/Zi',
     '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN',
     "/Fo$obj\", "/Fd$obj\QuickPad-compile.pdb"
 )
-Invoke-Tool cl.exe ($compilerFlags + $sources)
+# The memory functions in nocrt.c stand in for compiler helpers, which whole program optimization
+# does not allow, so that file is compiled without /GL.
+$helperSources = $sources | Where-Object { (Split-Path $_ -Leaf) -eq 'nocrt.c' }
+$programSources = $sources | Where-Object { (Split-Path $_ -Leaf) -ne 'nocrt.c' }
+Invoke-Tool cl.exe ($compilerFlags + '/GL' + $programSources)
+Invoke-Tool cl.exe ($compilerFlags + $helperSources)
 
 $linkerFlags = @(
     '/nologo', '/NODEFAULTLIB', '/ENTRY:QuickPadEntry', '/SUBSYSTEM:WINDOWS',
@@ -78,6 +83,7 @@ $linkerFlags = @(
     '/STACK:0x100000,0x100000', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/MANIFEST:NO',
     "/OUT:$bin\QuickPad.exe"
 )
+# Libraries only the editor needs are bound on first use in src\lazyload.c and are not linked here.
 $libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib', 'ntdll.lib')
 Invoke-Tool link.exe ($linkerFlags + $objects + $libraries)
 
@@ -100,10 +106,11 @@ if ($Test) {
         'layout_tests'   = @('layout.c')
         'history_tests'  = @('history.c', 'document.c')
         'search_tests'   = @('search.c')
+        'textview_tests' = @('textview.c', 'document.c', 'history.c', 'layout.c', 'search.c')
     }
     foreach ($name in $unitTests.Keys) {
         $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })
-        Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe", '/link', 'user32.lib'))
+        Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib', 'imm32.lib'))
     }
 
     foreach ($name in $unitTests.Keys) {
