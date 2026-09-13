@@ -251,8 +251,9 @@ int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, 
                 DispatchMessageW(&message);
             }
         }
-        if (!EditorIdle()) {
-            WaitMessage();
+        DWORD wait = INFINITE;
+        if (!EditorIdle(&wait)) {
+            MsgWaitForMultipleObjectsEx(0, NULL, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
 }

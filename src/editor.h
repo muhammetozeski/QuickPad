@@ -17,9 +17,10 @@ BOOL EditorOpenNew(void);
 
 /*
  * Keeps the pool of drawn, cloaked editor windows at its size, one window per call. Call it when the
- * message queue is empty; it returns FALSE when there was nothing to do.
+ * message queue is empty. It returns FALSE when there is nothing to do now; *wait is then how many
+ * milliseconds may pass before it has work again, or INFINITE.
  */
-BOOL EditorIdle(void);
+BOOL EditorIdle(DWORD *wait);
 
 int EditorPoolSize(void);
 void EditorSetPoolSize(int size);

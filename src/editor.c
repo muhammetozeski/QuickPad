@@ -20,6 +20,9 @@
 /* Windows waiting in the pool sit here, cloaked, so they never cover anything or take input. */
 #define PARK_POSITION (-32000)
 
+/* The pool is refilled only after windows have stopped opening and closing for this long. */
+#define POOL_QUIET_PERIOD 5000
+
 enum EncodingChoice {
     CHOICE_UTF8,
     CHOICE_UTF8_WITH_MARK,
@@ -55,6 +58,7 @@ static Editor *editors;
 static BOOL comReady;
 static BOOL residentProcess;
 static HWND ownerWindow;
+static ULONGLONG lastWindowChange;
 
 /* ---- Small helpers ------------------------------------------------------------------------- */
 
@@ -260,12 +264,19 @@ static void ShowEditor(Editor *editor)
         return;
     }
 
-    /* Everything happens while the window is still cloaked, so it appears complete in one frame. */
+    /*
+     * Everything happens while the window is still cloaked, so it appears complete in one frame.
+     * The next pooled window usually already waits at this frame and only needs raising.
+     */
     RECT frame = NewWindowFrame();
+    RECT current;
+    GetWindowRect(window, &current);
+    UINT keepFrame = EqualRect(&current, &frame) ? SWP_NOMOVE | SWP_NOSIZE : 0;
     editor->pooled = FALSE;
     editor->shown = TRUE;
+    lastWindowChange = GetTickCount64();
     SetWindowLongPtrW(window, GWLP_HWNDPARENT, 0);
-    SetWindowPos(window, HWND_TOP, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, SWP_NOACTIVATE);
+    SetWindowPos(window, HWND_TOP, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, SWP_NOACTIVATE | keepFrame);
     RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
     SetCloaked(window, FALSE);
     SetForegroundWindow(window);
@@ -276,6 +287,7 @@ static void ShowEditor(Editor *editor)
 static void CloseEditor(Editor *editor)
 {
     HWND window = editor->window;
+    lastWindowChange = GetTickCount64();
     WINDOWPLACEMENT placement = { sizeof placement };
     if (editor->shown && GetWindowPlacement(window, &placement)) {
         int width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
@@ -794,21 +806,47 @@ BOOL EditorOpenNew(void)
     return TRUE;
 }
 
-BOOL EditorIdle(void)
+BOOL EditorIdle(DWORD *wait)
 {
+    *wait = INFINITE;
     if (!residentProcess) {
         return FALSE;
     }
-    int pooled = PoolCount();
-    if (pooled > settings.poolSize) {
-        for (Editor *editor = editors; editor != NULL; editor = editor->next) {
-            if (editor->pooled) {
-                DestroyWindow(editor->window);
-                return TRUE;
-            }
+    ULONGLONG now = GetTickCount64();
+    if (lastWindowChange != 0 && now < lastWindowChange + POOL_QUIET_PERIOD) {
+        *wait = (DWORD)(lastWindowChange + POOL_QUIET_PERIOD - now);
+        return FALSE;
+    }
+
+    Editor *next = NULL;
+    int pooled = 0;
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        if (editor->pooled) {
+            next = next != NULL ? next : editor;
+            ++pooled;
         }
     }
-    return pooled < settings.poolSize && CreateEditor() != NULL;
+    if (pooled > settings.poolSize) {
+        DestroyWindow(next->window);
+        return TRUE;
+    }
+    if (pooled < settings.poolSize) {
+        return CreateEditor() != NULL;
+    }
+
+    /* The window TakeEditor hands out next waits, cloaked, where the next window will open. */
+    if (next != NULL) {
+        RECT frame = NewWindowFrame();
+        RECT current;
+        GetWindowRect(next->window, &current);
+        if (!EqualRect(&current, &frame)) {
+            SetWindowPos(next->window, NULL, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+            RedrawWindow(next->window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 int EditorPoolSize(void)
