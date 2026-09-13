@@ -10,6 +10,7 @@
  */
 #include "quickpad.h"
 
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <imm.h>
 #include <objbase.h>
@@ -58,6 +59,9 @@ LAZY_POINTER(L"ole32.dll", HRESULT, return, CoCreateInstance,
     (REFCLSID classId, LPUNKNOWN outer, DWORD context, REFIID interfaceId, LPVOID *object),
     (classId, outer, context, interfaceId, object))
 LAZY_POINTER(L"ole32.dll", void, , CoTaskMemFree, (LPVOID block), (block))
+
+LAZY_POINTER(L"comdlg32.dll", HWND, return, FindTextW, (LPFINDREPLACEW data), (data))
+LAZY_POINTER(L"comdlg32.dll", HWND, return, ReplaceTextW, (LPFINDREPLACEW data), (data))
 
 LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegSetKeyValueW,
     (HKEY key, LPCWSTR subKey, LPCWSTR name, DWORD type, LPCVOID data, DWORD size),

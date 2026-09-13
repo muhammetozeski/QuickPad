@@ -9,6 +9,7 @@
 #include "textview.h"
 #include "theme.h"
 
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <shobjidl.h>
 
@@ -59,6 +60,13 @@ static BOOL comReady;
 static BOOL residentProcess;
 static HWND ownerWindow;
 static ULONGLONG lastWindowChange;
+
+/* One Find or Replace dialog serves every window; its search text and options carry over. */
+static HWND findDialog;
+static FINDREPLACEW findData;
+static wchar_t findWhat[256];
+static wchar_t replaceWith[256];
+static UINT findMessage;
 
 /* ---- Small helpers ------------------------------------------------------------------------- */
 
@@ -288,6 +296,10 @@ static void CloseEditor(Editor *editor)
 {
     HWND window = editor->window;
     lastWindowChange = GetTickCount64();
+    if (findDialog != NULL && findData.hwndOwner == window) {
+        DestroyWindow(findDialog);
+        findDialog = NULL;
+    }
     WINDOWPLACEMENT placement = { sizeof placement };
     if (editor->shown && GetWindowPlacement(window, &placement)) {
         int width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
@@ -586,6 +598,138 @@ static void ToggleWordWrap(void)
     }
 }
 
+/* ---- Find, replace and go to --------------------------------------------------------------- */
+
+static UINT_PTR CALLBACK FindDialogHook(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    INT_PTR themed = 0;
+    if (ThemeDialogMessage(dialog, message, wParam, lParam, &themed)) {
+        return (UINT_PTR)themed;
+    }
+    if (message == WM_INITDIALOG) {
+        ThemePrepareDialog(dialog);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static SearchOptions FindOptions(void)
+{
+    SearchOptions options = { (findData.Flags & FR_MATCHCASE) != 0, (findData.Flags & FR_WHOLEWORD) != 0 };
+    return options;
+}
+
+static void ShowNotFound(Editor *editor)
+{
+    wchar_t *message = StringJoin(L"Cannot find \"", findWhat, L"\"");
+    MessageBoxW(findDialog != NULL ? findDialog : editor->window, message != NULL ? message : findWhat, QP_APP_NAME,
+        MB_ICONINFORMATION);
+    MemFree(message);
+}
+
+static void ShowFindDialog(Editor *editor, BOOL replace)
+{
+    if (findDialog != NULL) {
+        DestroyWindow(findDialog);
+        findDialog = NULL;
+    }
+
+    /* A selection on one line becomes the text to find. */
+    size_t start = 0;
+    size_t end = 0;
+    TextViewGetSelection(editor->view, &start, &end);
+    if (end > start && end - start < ARRAYSIZE(findWhat)) {
+        size_t length = 0;
+        const wchar_t *text = TextViewGetText(editor->view, &length);
+        BOOL oneLine = text != NULL;
+        for (size_t i = start; oneLine && i < end; ++i) {
+            oneLine = text[i] != L'\n';
+        }
+        if (oneLine) {
+            memcpy(findWhat, text + start, (end - start) * sizeof(wchar_t));
+            findWhat[end - start] = 0;
+        }
+    }
+
+    findData.lStructSize = sizeof findData;
+    findData.hwndOwner = editor->window;
+    findData.lpstrFindWhat = findWhat;
+    findData.wFindWhatLen = ARRAYSIZE(findWhat);
+    findData.lpstrReplaceWith = replaceWith;
+    findData.wReplaceWithLen = ARRAYSIZE(replaceWith);
+    findData.Flags = (findData.Flags & (FR_MATCHCASE | FR_WHOLEWORD)) | FR_DOWN | FR_ENABLEHOOK;
+    findData.lpfnHook = FindDialogHook;
+    findDialog = replace ? ReplaceTextW(&findData) : FindTextW(&findData);
+}
+
+static void FindNext(Editor *editor, BOOL down)
+{
+    if (findWhat[0] == 0) {
+        ShowFindDialog(editor, FALSE);
+    } else if (!TextViewFind(editor->view, findWhat, FindOptions(), down)) {
+        ShowNotFound(editor);
+    }
+}
+
+static void HandleFindMessage(Editor *editor, const FINDREPLACEW *data)
+{
+    if ((data->Flags & FR_DIALOGTERM) != 0) {
+        findDialog = NULL;
+    } else if ((data->Flags & FR_FINDNEXT) != 0) {
+        FindNext(editor, (data->Flags & FR_DOWN) != 0);
+    } else if ((data->Flags & FR_REPLACE) != 0) {
+        if (!TextViewReplace(editor->view, findWhat, replaceWith, FindOptions())) {
+            ShowNotFound(editor);
+        }
+    } else if ((data->Flags & FR_REPLACEALL) != 0) {
+        if (TextViewReplaceAll(editor->view, findWhat, replaceWith, FindOptions()) == 0) {
+            ShowNotFound(editor);
+        }
+    }
+}
+
+static INT_PTR CALLBACK GoToProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    INT_PTR themed = 0;
+    if (ThemeDialogMessage(dialog, message, wParam, lParam, &themed)) {
+        return themed;
+    }
+
+    Editor *editor = (Editor *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG:
+        editor = (Editor *)lParam;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        ThemePrepareDialog(dialog);
+        SendDlgItemMessageW(dialog, IDC_GOTO_LINE, EM_LIMITTEXT, 10, 0);
+        SetDlgItemInt(dialog, IDC_GOTO_LINE, (UINT)(TextViewCaretLine(editor->view) + 1), FALSE);
+        SendDlgItemMessageW(dialog, IDC_GOTO_LINE, EM_SETSEL, 0, -1);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            BOOL valid = FALSE;
+            UINT line = GetDlgItemInt(dialog, IDC_GOTO_LINE, &valid, FALSE);
+            if (!valid || line == 0 || line > TextViewLineCount(editor->view)) {
+                MessageBoxW(dialog, L"The line number is beyond the total number of lines.", L"Go To Line", MB_ICONWARNING);
+                HWND edit = GetDlgItem(dialog, IDC_GOTO_LINE);
+                SetFocus(edit);
+                SendMessageW(edit, EM_SETSEL, 0, -1);
+                return TRUE;
+            }
+            EndDialog(dialog, IDOK);
+            TextViewGoToLine(editor->view, line - 1);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
 static void HandleCommand(Editor *editor, int command)
 {
     HWND view = editor->view;
@@ -626,6 +770,21 @@ static void HandleCommand(Editor *editor, int command)
     case IDM_EDIT_SELECT_ALL:
         TextViewSelectAll(view);
         break;
+    case IDM_EDIT_FIND:
+        ShowFindDialog(editor, FALSE);
+        break;
+    case IDM_EDIT_FIND_NEXT:
+        FindNext(editor, TRUE);
+        break;
+    case IDM_EDIT_FIND_PREVIOUS:
+        FindNext(editor, FALSE);
+        break;
+    case IDM_EDIT_REPLACE:
+        ShowFindDialog(editor, TRUE);
+        break;
+    case IDM_EDIT_GOTO:
+        DialogBoxParamW(instanceHandle, MAKEINTRESOURCEW(IDD_GOTO), editor->window, GoToProc, (LPARAM)editor);
+        break;
     case IDM_FORMAT_WORD_WRAP:
         ToggleWordWrap();
         break;
@@ -647,6 +806,10 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
     LRESULT themed = 0;
     if (ThemeMenuBarMessage(window, message, wParam, lParam, &themed)) {
         return themed;
+    }
+    if (message == findMessage && findMessage != 0) {
+        HandleFindMessage(editor, (const FINDREPLACEW *)lParam);
+        return 0;
     }
 
     switch (message) {
@@ -767,6 +930,7 @@ BOOL EditorInitialize(HINSTANCE instance)
     }
 
     accelerators = LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDR_ACCELERATORS));
+    findMessage = RegisterWindowMessageW(FINDMSGSTRINGW);
     HDC screen = GetDC(NULL);
     int dpi = GetDeviceCaps(screen, LOGPIXELSY);
     ReleaseDC(NULL, screen);
@@ -892,6 +1056,9 @@ BOOL EditorCloseAll(void)
 
 BOOL EditorTranslateMessage(MSG *message)
 {
+    if (findDialog != NULL && IsDialogMessageW(findDialog, message)) {
+        return TRUE;
+    }
     HWND root = message->hwnd != NULL ? GetAncestor(message->hwnd, GA_ROOT) : NULL;
     return root != NULL && (ATOM)GetClassLongPtrW(root, GCW_ATOM) == editorAtom
         && TranslateAcceleratorW(root, accelerators, message);
