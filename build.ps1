@@ -97,10 +97,11 @@ if ($Test) {
     $unitTests = [ordered]@{
         'text_tests'     = @('text.c')
         'document_tests' = @('document.c')
+        'layout_tests'   = @('layout.c')
     }
     foreach ($name in $unitTests.Keys) {
         $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })
-        Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe"))
+        Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe", '/link', 'user32.lib'))
     }
 
     foreach ($name in $unitTests.Keys) {
