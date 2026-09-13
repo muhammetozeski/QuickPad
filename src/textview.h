@@ -35,7 +35,10 @@ const wchar_t *TextViewGetText(HWND view, size_t *length);
 BOOL TextViewIsModified(HWND view);
 void TextViewMarkSaved(HWND view);
 
-/* The font stays owned by the caller and must be fixed-pitch for the columns to line up. */
+/*
+ * The font stays owned by the caller. Text is laid out in equal cells; with a proportional font a
+ * cell is the average width of its letters and digits.
+ */
 void TextViewSetFont(HWND view, HFONT font);
 void TextViewSetWordWrap(HWND view, BOOL wrap);
 

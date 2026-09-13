@@ -1028,13 +1028,16 @@ static void ApplyFont(TextView *view, HFONT font)
     HGDIOBJ previous = SelectObject(dc, font);
     TEXTMETRICW metrics;
     GetTextMetricsW(dc, &metrics);
-    SIZE digit = { 0 };
-    GetTextExtentPoint32W(dc, L"0", 1, &digit);
+    /* Every character gets one cell; with a proportional font the cell is the average letter and digit, rounded up. */
+    static const wchar_t sample[] = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    int sampleLength = ARRAYSIZE(sample) - 1;
+    SIZE extent = { 0 };
+    GetTextExtentPoint32W(dc, sample, sampleLength, &extent);
     SelectObject(dc, previous);
     ReleaseDC(view->window, dc);
 
     view->lineHeight = metrics.tmHeight + metrics.tmExternalLeading > 0 ? metrics.tmHeight + metrics.tmExternalLeading : 1;
-    view->charWidth = digit.cx > 0 ? digit.cx : 1;
+    view->charWidth = extent.cx > 0 ? (extent.cx + sampleLength - 1) / sampleLength : 1;
     view->margin = view->charWidth / 2 > 2 ? view->charWidth / 2 : 2;
     UpdateWrapColumns(view);
     if (view->focused) {

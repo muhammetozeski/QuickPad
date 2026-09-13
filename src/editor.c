@@ -907,6 +907,45 @@ static void WarmGlyphCache(void)
     DeleteDC(dc);
 }
 
+static int CALLBACK NoteFontFamily(const LOGFONTW *font, const TEXTMETRICW *metrics, DWORD type, LPARAM found)
+{
+    UNREFERENCED_PARAMETER(font);
+    UNREFERENCED_PARAMETER(metrics);
+    UNREFERENCED_PARAMETER(type);
+    *(BOOL *)found = TRUE;
+    return 0;
+}
+
+static BOOL FontInstalled(HDC dc, const wchar_t *face)
+{
+    LOGFONTW font = { 0 };
+    font.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(font.lfFaceName, face, LF_FACESIZE);
+    BOOL found = FALSE;
+    EnumFontFamiliesExW(dc, &font, NoteFontFamily, (LPARAM)&found, 0);
+    return found;
+}
+
+/*
+ * Comic Sans MS, or Courier New where it is missing: Courier New has shipped with every Windows
+ * version. The stock fixed font covers a system without either.
+ */
+static HFONT CreateEditorFont(void)
+{
+    static const wchar_t *const faces[] = { L"Comic Sans MS", L"Courier New" };
+    HDC screen = GetDC(NULL);
+    int dpi = GetDeviceCaps(screen, LOGPIXELSY);
+    HFONT font = NULL;
+    for (size_t i = 0; i < ARRAYSIZE(faces) && font == NULL; ++i) {
+        if (FontInstalled(screen, faces[i])) {
+            font = CreateFontW(-MulDiv(11, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faces[i]);
+        }
+    }
+    ReleaseDC(NULL, screen);
+    return font != NULL ? font : (HFONT)GetStockObject(ANSI_FIXED_FONT);
+}
+
 /* ---- Public functions ---------------------------------------------------------------------- */
 
 BOOL EditorInitialize(HINSTANCE instance)
@@ -932,14 +971,7 @@ BOOL EditorInitialize(HINSTANCE instance)
 
     accelerators = LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDR_ACCELERATORS));
     findMessage = RegisterWindowMessageW(FINDMSGSTRINGW);
-    HDC screen = GetDC(NULL);
-    int dpi = GetDeviceCaps(screen, LOGPIXELSY);
-    ReleaseDC(NULL, screen);
-    editorFont = CreateFontW(-MulDiv(11, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-    if (editorFont == NULL) {
-        return FALSE;
-    }
+    editorFont = CreateEditorFont();
     WarmGlyphCache();
     return TRUE;
 }
