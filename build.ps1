@@ -10,10 +10,14 @@
 
 .PARAMETER VcVars
     Full path of vcvars64.bat, for Visual Studio installations vswhere.exe does not know about.
+
+.PARAMETER Test
+    Also builds the programs in tests\ and runs the unit tests.
 #>
 [CmdletBinding()]
 param(
-    [string]$VcVars
+    [string]$VcVars,
+    [switch]$Test
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,3 +82,18 @@ $libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib')
 Invoke-Tool link.exe ($linkerFlags + $objects + $libraries)
 
 Write-Host "Built $bin\QuickPad.exe"
+
+if ($Test) {
+    $testObj = Join-Path $obj 'tests'
+    New-Item -ItemType Directory -Force $testObj | Out-Null
+
+    $testFlags = @(
+        '/nologo', '/W4', '/WX', '/std:c17', '/utf-8', '/O2', '/MT',
+        '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', "/I$root\src",
+        "/Fo$testObj\", "/Fd$testObj\"
+    )
+    Invoke-Tool cl.exe ($testFlags + @("$root\tests\text_tests.c", "$root\src\text.c", "/Fe$bin\text_tests.exe"))
+
+    & "$bin\text_tests.exe"
+    if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed.' }
+}
