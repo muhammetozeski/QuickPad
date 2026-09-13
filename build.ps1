@@ -13,11 +13,15 @@
 
 .PARAMETER Test
     Also builds the programs in tests\ and runs the unit tests.
+
+.PARAMETER Release
+    Copies the built QuickPad.exe to publish\, the folder that is signed and released.
 #>
 [CmdletBinding()]
 param(
     [string]$VcVars,
-    [switch]$Test
+    [switch]$Test,
+    [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,6 +109,13 @@ $libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib', 'ntdll.lib', 'uuid.lib
 Invoke-Tool link.exe ($linkerFlags + $objects + "$obj\QuickPad.res" + $libraries)
 
 Write-Host "Built $bin\QuickPad.exe"
+
+if ($Release) {
+    $publish = Join-Path $root 'publish'
+    New-Item -ItemType Directory -Force $publish | Out-Null
+    Copy-Item "$bin\QuickPad.exe" (Join-Path $publish 'QuickPad.exe') -Force
+    Write-Host "Published $publish\QuickPad.exe"
+}
 
 if ($Test) {
     $testObj = Join-Path $obj 'tests'
