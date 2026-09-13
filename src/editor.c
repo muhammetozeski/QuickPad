@@ -921,7 +921,8 @@ BOOL EditorInitialize(HINSTANCE instance)
     WNDCLASSEXW windowClass = { sizeof windowClass };
     windowClass.lpfnWndProc = EditorProc;
     windowClass.hInstance = instance;
-    windowClass.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    windowClass.hIcon = LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    windowClass.hIconSm = LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     windowClass.hCursor = LoadCursorW(NULL, IDC_ARROW);
     windowClass.lpszClassName = EDITOR_CLASS;
     editorAtom = RegisterClassExW(&windowClass);

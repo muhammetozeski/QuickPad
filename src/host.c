@@ -23,7 +23,8 @@ static void AddTrayIcon(void)
     data.uID = TRAY_ICON_ID;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = WM_HOST_TRAY;
-    data.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    data.hIcon = LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON), 0);
     lstrcpynW(data.szTip, QP_APP_NAME, ARRAYSIZE(data.szTip));
     Shell_NotifyIconW(NIM_ADD, &data);
     data.uVersion = NOTIFYICON_VERSION_4;

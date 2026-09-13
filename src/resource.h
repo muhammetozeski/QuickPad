@@ -1,5 +1,7 @@
 #pragma once
 
+#define IDI_APP                  1
+
 #define IDR_MENU                 100
 #define IDR_ACCELERATORS         101
 

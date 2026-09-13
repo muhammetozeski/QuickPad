@@ -91,7 +91,7 @@ Invoke-Tool link.exe @(
     "$shellObj\QuickPadShell.obj", "$shellObj\nocrt.obj", 'kernel32.lib', 'user32.lib', 'ole32.lib', 'uuid.lib', 'ntdll.lib'
 )
 
-Invoke-Tool rc.exe @('/nologo', '/i', $bin, '/fo', "$obj\QuickPad.res", "$root\res\QuickPad.rc")
+Invoke-Tool rc.exe @('/nologo', '/i', "$root\res", '/i', $bin, '/fo', "$obj\QuickPad.res", "$root\res\QuickPad.rc")
 
 $linkerFlags = @(
     '/nologo', '/NODEFAULTLIB', '/ENTRY:QuickPadEntry', '/SUBSYSTEM:WINDOWS',

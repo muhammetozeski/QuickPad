@@ -3,6 +3,8 @@
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
+IDI_APP ICON "QuickPad.ico"
+
 /* Built before this script and found through the include path build.ps1 passes. */
 IDR_SHELL_EXTENSION RCDATA "QuickPadShell.dll"
 
