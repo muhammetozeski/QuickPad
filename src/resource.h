@@ -16,3 +16,5 @@
 #define IDM_EDIT_PASTE           40014
 #define IDM_EDIT_DELETE          40015
 #define IDM_EDIT_SELECT_ALL      40021
+
+#define IDM_FORMAT_WORD_WRAP     40030

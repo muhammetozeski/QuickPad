@@ -4,6 +4,7 @@
 #include "fileio.h"
 #include "quickpad.h"
 #include "resource.h"
+#include "settings.h"
 #include "textview.h"
 #include "theme.h"
 
@@ -436,6 +437,16 @@ static void UpdateMenu(Editor *editor, HMENU menu)
     EnableMenuItem(menu, IDM_EDIT_COPY, selection);
     EnableMenuItem(menu, IDM_EDIT_DELETE, selection);
     EnableMenuItem(menu, IDM_EDIT_PASTE, TextViewCanPaste(editor->view) ? MF_ENABLED : MF_GRAYED);
+    CheckMenuItem(menu, IDM_FORMAT_WORD_WRAP, settings.wordWrap ? MF_CHECKED : MF_UNCHECKED);
+}
+
+static void ToggleWordWrap(void)
+{
+    settings.wordWrap = !settings.wordWrap;
+    SettingsSave();
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        TextViewSetWordWrap(editor->view, settings.wordWrap);
+    }
 }
 
 static void HandleCommand(Editor *editor, int command)
@@ -478,6 +489,9 @@ static void HandleCommand(Editor *editor, int command)
     case IDM_EDIT_SELECT_ALL:
         TextViewSelectAll(view);
         break;
+    case IDM_FORMAT_WORD_WRAP:
+        ToggleWordWrap();
+        break;
     }
 }
 
@@ -508,6 +522,7 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         ThemePrepareScrollBars(editor->view);
         TextViewSetColors(editor->view, ThemeTextColors());
         TextViewSetFont(editor->view, editorFont);
+        TextViewSetWordWrap(editor->view, settings.wordWrap);
         return 0;
 
     case WM_SIZE:
@@ -571,6 +586,7 @@ BOOL EditorInitialize(HINSTANCE instance)
         return FALSE;
     }
     ThemeInitialize();
+    SettingsLoad();
 
     WNDCLASSEXW windowClass = { sizeof windowClass };
     windowClass.lpfnWndProc = EditorProc;

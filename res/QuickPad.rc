@@ -26,6 +26,10 @@ BEGIN
         MENUITEM SEPARATOR
         MENUITEM "Select &All\tCtrl+A",     IDM_EDIT_SELECT_ALL
     END
+    POPUP "F&ormat"
+    BEGIN
+        MENUITEM "&Word Wrap",              IDM_FORMAT_WORD_WRAP
+    END
 END
 
 IDR_ACCELERATORS ACCELERATORS
