@@ -75,6 +75,7 @@ $helperSources = $sources | Where-Object { (Split-Path $_ -Leaf) -eq 'nocrt.c' }
 $programSources = $sources | Where-Object { (Split-Path $_ -Leaf) -ne 'nocrt.c' }
 Invoke-Tool cl.exe ($compilerFlags + '/GL' + $programSources)
 Invoke-Tool cl.exe ($compilerFlags + $helperSources)
+Invoke-Tool rc.exe @('/nologo', '/fo', "$obj\QuickPad.res", "$root\res\QuickPad.rc")
 
 $linkerFlags = @(
     '/nologo', '/NODEFAULTLIB', '/ENTRY:QuickPadEntry', '/SUBSYSTEM:WINDOWS',
@@ -84,8 +85,8 @@ $linkerFlags = @(
     "/OUT:$bin\QuickPad.exe"
 )
 # Libraries only the editor needs are bound on first use in src\lazyload.c and are not linked here.
-$libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib', 'ntdll.lib')
-Invoke-Tool link.exe ($linkerFlags + $objects + $libraries)
+$libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib', 'ntdll.lib', 'uuid.lib')
+Invoke-Tool link.exe ($linkerFlags + $objects + "$obj\QuickPad.res" + $libraries)
 
 Write-Host "Built $bin\QuickPad.exe"
 
@@ -107,6 +108,7 @@ if ($Test) {
         'history_tests'  = @('history.c', 'document.c')
         'search_tests'   = @('search.c')
         'textview_tests' = @('textview.c', 'document.c', 'history.c', 'layout.c', 'search.c')
+        'fileio_tests'   = @('fileio.c', 'text.c')
     }
     foreach ($name in $unitTests.Keys) {
         $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })
