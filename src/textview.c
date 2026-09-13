@@ -12,6 +12,19 @@
 #define AUTOSCROLL_INTERVAL 40
 #define VISIBLE_GLYPH_SLACK 256
 
+/* A painted row longer than this beyond the window has the rest of its width estimated from its length. */
+#define MEASURED_REMAINDER 4096
+
+/* Character widths of one font, shared by every view that uses it. */
+typedef struct FontMetrics {
+    struct FontMetrics *next;
+    HFONT font;
+    int users;
+    LayoutMetrics layout;
+} FontMetrics;
+
+static FontMetrics *fontMetrics;
+
 enum {
     MENU_UNDO = 1,
     MENU_CUT,
@@ -37,12 +50,16 @@ typedef struct TextView {
     int clientWidth;
     int clientHeight;
     BOOL wordWrap;
-    size_t wrapColumns;
+    long long wrapWidth;
     size_t topLine;
     size_t topRow;
     long long scrollX;
-    size_t longestLine;
-    BOOL longestLineStale;
+    long long widestRow;     /* widest row painted since the text was set; the horizontal scroll range */
+    FontMetrics *shared;
+    LayoutMetrics *metrics;
+    int tabCells;
+    BOOL autoIndent;
+    BOOL notifySelection;
     BOOL focused;
     BOOL selecting;
     int wheelDelta;
@@ -75,6 +92,76 @@ typedef struct Colors {
 static TextView *ViewFrom(HWND window)
 {
     return (TextView *)GetWindowLongPtrW(window, 0);
+}
+
+/* Widths of the glyphs the font has; characters it lacks keep the cell widths layout.c gives them. */
+static void MeasureWithFont(void *context, wchar_t first, int *widths)
+{
+    wchar_t characters[256];
+    WORD glyphs[256];
+    INT measured[256];
+    for (int i = 0; i < 256; ++i) {
+        characters[i] = (wchar_t)(first + i);
+    }
+    HDC dc = GetDC(NULL);
+    HGDIOBJ previous = SelectObject(dc, (HFONT)context);
+    if (GetCharWidth32W(dc, first, (UINT)first + 255, measured)
+        && GetGlyphIndicesW(dc, characters, 256, glyphs, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR) {
+        for (int i = 0; i < 256; ++i) {
+            if (glyphs[i] != 0xFFFF) {
+                widths[i] = measured[i];
+            }
+        }
+    }
+    SelectObject(dc, previous);
+    ReleaseDC(NULL, dc);
+}
+
+static FontMetrics *AcquireMetrics(HFONT font, int cellWidth)
+{
+    for (FontMetrics *entry = fontMetrics; entry != NULL; entry = entry->next) {
+        if (entry->font == font && entry->layout.cellWidth == cellWidth) {
+            ++entry->users;
+            return entry;
+        }
+    }
+    FontMetrics *entry = MemAllocZero(sizeof *entry);
+    if (entry == NULL) {
+        return NULL;
+    }
+    entry->font = font;
+    entry->users = 1;
+    LayoutMetricsInitialize(&entry->layout, cellWidth, MeasureWithFont, font);
+    entry->next = fontMetrics;
+    fontMetrics = entry;
+    return entry;
+}
+
+static void ReleaseMetrics(FontMetrics *entry)
+{
+    if (entry == NULL || --entry->users > 0) {
+        return;
+    }
+    FontMetrics **link = &fontMetrics;
+    while (*link != NULL && *link != entry) {
+        link = &(*link)->next;
+    }
+    if (*link != NULL) {
+        *link = entry->next;
+    }
+    LayoutMetricsRelease(&entry->layout);
+    MemFree(entry);
+}
+
+/* Tells the parent the caret or selection moved, when it asked for that. */
+static void NotifySelection(TextView *view)
+{
+    if (view->notifySelection) {
+        HWND parent = GetParent(view->window);
+        if (parent != NULL) {
+            SendMessageW(parent, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(view->window), TEXTVIEW_SELECTION_CHANGED), (LPARAM)view->window);
+        }
+    }
 }
 
 /* Grows a scratch block; its old contents are not kept. */
@@ -146,7 +233,7 @@ static size_t LineRows(TextView *view, const wchar_t *text, size_t length)
         view->rows[0] = 0;
         return 1;
     }
-    return LayoutWrapLine(text, length, view->wrapColumns, view->rows);
+    return LayoutWrapLine(view->metrics, text, length, view->wrapWidth, view->rows);
 }
 
 static size_t RowOfOffset(const TextView *view, size_t rowCount, size_t offset, BOOL trailing)
@@ -170,7 +257,7 @@ static Place Locate(TextView *view, size_t position, BOOL trailing)
     size_t offset = position - DocumentLineStart(&view->document, place.line);
     size_t rowCount = LineRows(view, text, length);
     place.row = RowOfOffset(view, rowCount, offset, trailing);
-    place.x = (long long)LayoutAdvance(text, view->rows[place.row], offset, 0) * view->charWidth;
+    place.x = LayoutAdvance(view->metrics, text, view->rows[place.row], offset, 0);
     return place;
 }
 
@@ -265,47 +352,14 @@ static long long RowsBetween(TextView *view, size_t fromLine, size_t fromRow, si
     return distance > limit ? limit : distance;
 }
 
-static size_t LongestLine(TextView *view)
-{
-    if (view->longestLineStale) {
-        const Document *document = &view->document;
-        size_t lineCount = DocumentLineCount(document);
-        size_t longest = 0;
-        for (size_t line = 0; line < lineCount; ++line) {
-            size_t length = DocumentLineEnd(document, line) - DocumentLineStart(document, line);
-            if (length > longest) {
-                longest = length;
-            }
-        }
-        view->longestLine = longest;
-        view->longestLineStale = FALSE;
-    }
-    return view->longestLine;
-}
-
-static void NoteInsertedText(TextView *view, size_t start, size_t length)
-{
-    if (view->longestLineStale) {
-        return;
-    }
-    const Document *document = &view->document;
-    size_t last = DocumentLineFromPosition(document, start + length);
-    for (size_t line = DocumentLineFromPosition(document, start); line <= last; ++line) {
-        size_t lineLength = DocumentLineEnd(document, line) - DocumentLineStart(document, line);
-        if (lineLength > view->longestLine) {
-            view->longestLine = lineLength;
-        }
-    }
-}
-
-static void UpdateWrapColumns(TextView *view)
+static void UpdateWrapWidth(TextView *view)
 {
     if (!view->wordWrap) {
-        view->wrapColumns = 0;
+        view->wrapWidth = 0;
         return;
     }
     int width = view->clientWidth - view->margin * 2;
-    view->wrapColumns = width > view->charWidth ? (size_t)(width / view->charWidth) : 1;
+    view->wrapWidth = width > view->charWidth ? width : view->charWidth;
 }
 
 /* ---- Scrolling ----------------------------------------------------------------------------- */
@@ -345,7 +399,7 @@ static void ClampVertical(TextView *view)
 
 static long long ContentWidth(TextView *view)
 {
-    return (long long)(LongestLine(view) + 1) * view->charWidth + view->margin * 2;
+    return view->widestRow + view->charWidth + view->margin * 2;
 }
 
 static void ClampHorizontal(TextView *view)
@@ -485,6 +539,7 @@ static void MoveCaret(TextView *view, size_t position, BOOL extend, BOOL trailin
     }
     HistoryBreakMerge(&view->history);
     RevealCaret(view);
+    NotifySelection(view);
 }
 
 static size_t PreviousPosition(const TextView *view, size_t position)
@@ -635,7 +690,7 @@ static void KeyVertical(TextView *view, long long delta, BOOL extend)
     const wchar_t *text = LineText(view, line, &length);
     size_t rowCount = LineRows(view, text, length);
     size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
-    size_t offset = LayoutOffsetAtX(text, view->rows[row], rowEnd, view->desiredX, view->charWidth);
+    size_t offset = LayoutOffsetAtX(view->metrics, text, view->rows[row], rowEnd, view->desiredX);
     BOOL trailing = offset == rowEnd && row + 1 < rowCount;
     MoveCaret(view, DocumentLineStart(&view->document, line) + offset, extend, trailing, TRUE);
 }
@@ -666,7 +721,7 @@ static size_t PositionFromPoint(TextView *view, int x, int y, BOOL *trailing)
     }
     size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
     long long textX = (long long)x - view->margin + (view->wordWrap ? 0 : view->scrollX);
-    size_t offset = LayoutOffsetAtX(text, view->rows[row], rowEnd, textX, view->charWidth);
+    size_t offset = LayoutOffsetAtX(view->metrics, text, view->rows[row], rowEnd, textX);
     *trailing = offset == rowEnd && row + 1 < rowCount;
     return DocumentLineStart(&view->document, line) + offset;
 }
@@ -687,16 +742,12 @@ static BOOL ReplaceRange(TextView *view, size_t start, size_t end, const wchar_t
         MessageBeep(MB_ICONERROR);
         return FALSE;
     }
-    if (end > start) {
-        view->longestLineStale = TRUE;
-    } else {
-        NoteInsertedText(view, start, length);
-    }
     view->anchor = view->caret = start + length;
     view->caretTrailing = FALSE;
     view->desiredX = -1;
     RevealCaret(view);
     NotifyChange(view);
+    NotifySelection(view);
     return TRUE;
 }
 
@@ -706,6 +757,27 @@ static void TypeCharacter(TextView *view, wchar_t ch)
     size_t end;
     Selection(view, &start, &end);
     ReplaceRange(view, start, end, &ch, 1, ch == L'\n' ? EDIT_OTHER : EDIT_TYPING);
+}
+
+/* A line break followed by the spaces and tabs the current line starts with, up to 256 of them. */
+static void BreakLineWithIndent(TextView *view)
+{
+    size_t start;
+    size_t end;
+    Selection(view, &start, &end);
+    const Document *document = &view->document;
+    size_t lineStart = DocumentLineStart(document, DocumentLineFromPosition(document, start));
+    wchar_t text[257];
+    size_t length = 0;
+    text[length++] = L'\n';
+    while (lineStart + length - 1 < start && length < ARRAYSIZE(text)) {
+        wchar_t ch = DocumentCharAt(document, lineStart + length - 1);
+        if (ch != L' ' && ch != L'\t') {
+            break;
+        }
+        text[length++] = ch;
+    }
+    ReplaceRange(view, start, end, text, length, EDIT_OTHER);
 }
 
 static void Backspace(TextView *view, BOOL word)
@@ -903,20 +975,19 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
 {
     int charWidth = view->charWidth;
     int bottom = y + view->lineHeight;
-    long long x = view->margin - (view->wordWrap ? 0 : view->scrollX);
+    long long origin = view->margin - (view->wordWrap ? 0 : view->scrollX);
+    long long x = origin;
     if (x > 0) {
         FillBox(dc, colors->background, 0, y, x < view->clientWidth ? x : view->clientWidth, bottom);
     }
 
-    size_t column = 0;
     size_t i = rowStart;
     while (i < rowEnd) {
-        size_t width = LayoutCharColumns(text[i], column);
-        if (width > 0 && x + (long long)width * charWidth > 0) {
+        int width = LayoutCharWidth(view->metrics, text[i], x - origin);
+        if (width > 0 && x + width > 0) {
             break;
         }
-        x += (long long)width * charWidth;
-        column += width;
+        x += width;
         ++i;
     }
 
@@ -924,16 +995,25 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
     size_t count = 0;
     while (i < rowEnd && count < glyphLimit) {
         wchar_t ch = text[i];
-        size_t width = LayoutCharColumns(ch, column);
+        int width = LayoutCharWidth(view->metrics, ch, x - origin);
         if (x >= view->clientWidth && width > 0) {
             break;
         }
         view->glyphs[count] = ch == L'\t' ? L' ' : ch;
-        view->advances[count] = (int)width * charWidth;
+        view->advances[count] = width;
         ++count;
-        x += (long long)width * charWidth;
-        column += width;
+        x += width;
         ++i;
+    }
+
+    if (!view->wordWrap) {
+        long long rowWidth = x - origin;
+        size_t remaining = rowEnd - i;
+        rowWidth = remaining <= MEASURED_REMAINDER ? LayoutAdvance(view->metrics, text, i, rowEnd, rowWidth)
+                                                   : rowWidth + (long long)remaining * charWidth;
+        if (rowWidth > view->widestRow) {
+            view->widestRow = rowWidth;
+        }
     }
 
     long long runX = x;
@@ -985,7 +1065,8 @@ static void PaintArea(TextView *view, HDC dc, const RECT *area)
     size_t selectionEnd;
     Selection(view, &selectionStart, &selectionEnd);
 
-    size_t visibleGlyphs = (size_t)(view->clientWidth / view->charWidth) + VISIBLE_GLYPH_SLACK;
+    /* A glyph is at least a pixel wide, so a row never needs more glyphs than the window has pixels. */
+    size_t visibleGlyphs = (size_t)(view->clientWidth > 0 ? view->clientWidth : 0) + VISIBLE_GLYPH_SLACK;
     size_t lineCount = DocumentLineCount(&view->document);
     int y = 0;
     size_t line = view->topLine;
@@ -1028,7 +1109,10 @@ static void ApplyFont(TextView *view, HFONT font)
     HGDIOBJ previous = SelectObject(dc, font);
     TEXTMETRICW metrics;
     GetTextMetricsW(dc, &metrics);
-    /* Every character gets one cell; with a proportional font the cell is the average letter and digit, rounded up. */
+    /*
+     * The cell is the average width of letters and digits, rounded up. It sizes the margin, tab stops,
+     * scroll steps and the characters the font has no glyph for; text uses the widths of its glyphs.
+     */
     static const wchar_t sample[] = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     int sampleLength = ARRAYSIZE(sample) - 1;
     SIZE extent = { 0 };
@@ -1039,7 +1123,16 @@ static void ApplyFont(TextView *view, HFONT font)
     view->lineHeight = metrics.tmHeight + metrics.tmExternalLeading > 0 ? metrics.tmHeight + metrics.tmExternalLeading : 1;
     view->charWidth = extent.cx > 0 ? (extent.cx + sampleLength - 1) / sampleLength : 1;
     view->margin = view->charWidth / 2 > 2 ? view->charWidth / 2 : 2;
-    UpdateWrapColumns(view);
+
+    FontMetrics *shared = AcquireMetrics(font, view->charWidth);
+    if (shared != NULL) {
+        ReleaseMetrics(view->shared);
+        view->shared = shared;
+        view->metrics = &shared->layout;
+    }
+    LayoutSetTabCells(view->metrics, view->tabCells);
+    view->widestRow = 0;
+    UpdateWrapWidth(view);
     if (view->focused) {
         DestroyCaret();
         CreateCaret(view->window, NULL, CaretWidth(), view->lineHeight);
@@ -1187,6 +1280,7 @@ static void HandleScrollBar(TextView *view, int bar, WPARAM wParam)
 
 static void DestroyView(TextView *view)
 {
+    ReleaseMetrics(view->shared);
     DocumentRelease(&view->document);
     HistoryRelease(&view->history);
     MemFree(view->lineCopy);
@@ -1215,6 +1309,7 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
             }
             HistoryInitialize(&view->history);
             view->desiredX = -1;
+            view->tabCells = LAYOUT_DEFAULT_TAB_CELLS;
             view->lineHeight = 1;
             view->charWidth = 1;
             SetWindowLongPtrW(window, 0, (LONG_PTR)view);
@@ -1235,15 +1330,19 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
     case WM_SIZE:
         view->clientWidth = LOWORD(lParam);
         view->clientHeight = HIWORD(lParam);
-        UpdateWrapColumns(view);
+        UpdateWrapWidth(view);
         Redraw(view);
         return 0;
 
     case WM_PAINT: {
+        long long widest = view->widestRow;
         PAINTSTRUCT paint;
         HDC dc = BeginPaint(window, &paint);
         PaintArea(view, dc, &paint.rcPaint);
         EndPaint(window, &paint);
+        if (view->widestRow != widest && !view->wordWrap) {
+            UpdateScrollBars(view);
+        }
         return 0;
     }
 
@@ -1293,7 +1392,9 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
         if (ch == L'\r') {
             ch = L'\n';
         }
-        if ((ch >= 0x20 && ch != 0x7F) || ch == L'\n' || ch == L'\t') {
+        if (ch == L'\n' && view->autoIndent) {
+            BreakLineWithIndent(view);
+        } else if ((ch >= 0x20 && ch != 0x7F) || ch == L'\n' || ch == L'\t') {
             TypeCharacter(view, ch);
         }
         return 0;
@@ -1372,6 +1473,10 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
         return 0;
 
     case WM_MOUSEWHEEL: {
+        if ((GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0) {
+            /* Ctrl with the wheel is for the parent, which changes the text size. */
+            break;
+        }
         UINT lines = 3;
         SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
         view->wheelDelta += GET_WHEEL_DELTA_WPARAM(wParam);
@@ -1495,8 +1600,9 @@ static void ResetView(TextView *view)
     view->topLine = 0;
     view->topRow = 0;
     view->scrollX = 0;
-    view->longestLineStale = TRUE;
+    view->widestRow = 0;
     RevealCaret(view);
+    NotifySelection(view);
 }
 
 BOOL TextViewSetText(HWND window, wchar_t *text, size_t length)
@@ -1558,7 +1664,7 @@ void TextViewSetWordWrap(HWND window, BOOL wrap)
     view->scrollX = 0;
     view->caretTrailing = FALSE;
     view->desiredX = -1;
-    UpdateWrapColumns(view);
+    UpdateWrapWidth(view);
     ShowScrollBar(window, SB_HORZ, !wrap);
     RevealCaret(view);
 }
@@ -1616,9 +1722,9 @@ static void AfterHistoryStep(TextView *view, size_t anchor, size_t caret)
     view->caret = caret;
     view->caretTrailing = FALSE;
     view->desiredX = -1;
-    view->longestLineStale = TRUE;
     RevealCaret(view);
     NotifyChange(view);
+    NotifySelection(view);
 }
 
 void TextViewUndo(HWND window)
@@ -1744,6 +1850,7 @@ void TextViewSelectAll(HWND window)
     view->desiredX = -1;
     HistoryBreakMerge(&view->history);
     Redraw(view);
+    NotifySelection(view);
 }
 
 BOOL TextViewFind(HWND window, const wchar_t *pattern, SearchOptions options, BOOL down)
@@ -1778,6 +1885,55 @@ BOOL TextViewReplace(HWND window, const wchar_t *pattern, const wchar_t *with, S
         ReplaceRange(view, start, end, with, (size_t)lstrlenW(with), EDIT_OTHER);
     }
     return TextViewFind(window, pattern, options, TRUE);
+}
+
+BOOL TextViewReplaceRange(HWND window, size_t start, size_t end, const wchar_t *text, size_t length)
+{
+    TextView *view = ViewFrom(window);
+    size_t documentLength = DocumentLength(&view->document);
+    end = end < documentLength ? end : documentLength;
+    start = start < end ? start : end;
+    return ReplaceRange(view, start, end, text, length, EDIT_OTHER);
+}
+
+size_t TextViewLineStart(HWND window, size_t line)
+{
+    return DocumentLineStart(&ViewFrom(window)->document, line);
+}
+
+size_t TextViewLineEnd(HWND window, size_t line)
+{
+    return DocumentLineEnd(&ViewFrom(window)->document, line);
+}
+
+size_t TextViewLineFromPosition(HWND window, size_t position)
+{
+    return DocumentLineFromPosition(&ViewFrom(window)->document, position);
+}
+
+size_t TextViewCaretPosition(HWND window)
+{
+    return ViewFrom(window)->caret;
+}
+
+void TextViewSetTabSize(HWND window, int cells)
+{
+    TextView *view = ViewFrom(window);
+    view->tabCells = cells > 0 ? cells : LAYOUT_DEFAULT_TAB_CELLS;
+    LayoutSetTabCells(view->metrics, view->tabCells);
+    view->widestRow = 0;
+    view->desiredX = -1;
+    RevealCaret(view);
+}
+
+void TextViewSetAutoIndent(HWND window, BOOL autoIndent)
+{
+    ViewFrom(window)->autoIndent = autoIndent;
+}
+
+void TextViewNotifySelection(HWND window, BOOL notify)
+{
+    ViewFrom(window)->notifySelection = notify;
 }
 
 size_t TextViewReplaceAll(HWND window, const wchar_t *pattern, const wchar_t *with, SearchOptions options)

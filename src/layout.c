@@ -1,4 +1,5 @@
 #include "layout.h"
+#include "quickpad.h"
 
 static BOOL IsZeroWidth(wchar_t ch)
 {
@@ -15,72 +16,110 @@ static BOOL IsWide(wchar_t ch)
         || (ch >= 0xFF00 && ch <= 0xFF60) || (ch >= 0xFFE0 && ch <= 0xFFE6);
 }
 
-size_t LayoutCharColumns(wchar_t ch, size_t column)
+void LayoutMetricsInitialize(LayoutMetrics *metrics, int cellWidth, LayoutMeasure *measure, void *context)
 {
-    if (ch < 0x0300) {
-        return ch == L'\t' ? LAYOUT_TAB_SIZE - column % LAYOUT_TAB_SIZE : 1;
+    for (size_t i = 0; i < ARRAYSIZE(metrics->pages); ++i) {
+        metrics->pages[i] = NULL;
     }
-    if (ch >= 0xDC00 && ch <= 0xDFFF) {
-        return 0;
-    }
-    if (ch >= 0xD800 && ch <= 0xDBFF) {
-        return 2;
-    }
-    if (IsZeroWidth(ch)) {
-        return 0;
-    }
-    return IsWide(ch) ? 2 : 1;
+    metrics->cellWidth = cellWidth > 0 ? cellWidth : 1;
+    metrics->tabWidth = metrics->cellWidth * LAYOUT_DEFAULT_TAB_CELLS;
+    metrics->measure = measure;
+    metrics->context = context;
 }
 
-size_t LayoutAdvance(const wchar_t *text, size_t from, size_t to, size_t column)
+void LayoutMetricsRelease(LayoutMetrics *metrics)
 {
-    for (size_t i = from; i < to; ++i) {
-        column += LayoutCharColumns(text[i], column);
+    for (size_t i = 0; i < ARRAYSIZE(metrics->pages); ++i) {
+        MemFree(metrics->pages[i]);
+        metrics->pages[i] = NULL;
     }
-    return column;
 }
 
-size_t LayoutOffsetAtX(const wchar_t *text, size_t from, size_t to, long long x, int charWidth)
+void LayoutSetTabCells(LayoutMetrics *metrics, int cells)
 {
-    size_t column = 0;
+    metrics->tabWidth = metrics->cellWidth * (cells > 0 ? cells : 1);
+}
+
+int *LayoutLoadPage(LayoutMetrics *metrics, unsigned page)
+{
+    int *widths = MemAlloc(256 * sizeof(int));
+    BOOL owned = widths != NULL;
+    if (!owned) {
+        widths = metrics->spare;
+    }
+
+    wchar_t first = (wchar_t)(page << 8);
+    int cell = metrics->cellWidth;
+    for (int i = 0; i < 256; ++i) {
+        widths[i] = IsWide((wchar_t)(first + i)) ? 2 * cell : cell;
+    }
+    if (metrics->measure != NULL) {
+        metrics->measure(metrics->context, first, widths);
+    }
+    for (int i = 0; i < 256; ++i) {
+        wchar_t ch = (wchar_t)(first + i);
+        if (IsZeroWidth(ch) || IS_LOW_SURROGATE(ch)) {
+            widths[i] = 0;
+        } else if (IS_HIGH_SURROGATE(ch)) {
+            widths[i] = 2 * cell;
+        } else if (widths[i] < 0) {
+            widths[i] = cell;
+        }
+    }
+
+    if (owned) {
+        metrics->pages[page] = widths;
+    }
+    return widths;
+}
+
+long long LayoutAdvance(LayoutMetrics *metrics, const wchar_t *text, size_t from, size_t to, long long x)
+{
     for (size_t i = from; i < to; ++i) {
-        size_t width = LayoutCharColumns(text[i], column);
+        x += LayoutCharWidth(metrics, text[i], x);
+    }
+    return x;
+}
+
+size_t LayoutOffsetAtX(LayoutMetrics *metrics, const wchar_t *text, size_t from, size_t to, long long x)
+{
+    long long left = 0;
+    for (size_t i = from; i < to; ++i) {
+        int width = LayoutCharWidth(metrics, text[i], left);
         if (width == 0) {
             continue;
         }
-        long long left = (long long)column * charWidth;
-        long long right = (long long)(column + width) * charWidth;
-        if (x * 2 < left + right) {
+        if (x * 2 < left * 2 + width) {
             return i;
         }
-        column += width;
+        left += width;
     }
     return to;
 }
 
-size_t LayoutWrapLine(const wchar_t *text, size_t length, size_t wrapColumns, size_t *rows)
+size_t LayoutWrapLine(LayoutMetrics *metrics, const wchar_t *text, size_t length, long long wrapWidth, size_t *rows)
 {
     size_t count = 0;
     rows[count++] = 0;
-    if (wrapColumns == 0) {
+    if (wrapWidth <= 0) {
         return count;
     }
 
     size_t rowStart = 0;
-    size_t column = 0;
+    long long x = 0;
     size_t breakAfterSpace = 0;
     for (size_t i = 0; i < length; ++i) {
         wchar_t ch = text[i];
         BOOL space = ch == L' ' || ch == L'\t';
-        size_t width = LayoutCharColumns(ch, column);
-        if (!space && width > 0 && column + width > wrapColumns && i > rowStart) {
+        int width = LayoutCharWidth(metrics, ch, x);
+        if (!space && width > 0 && x + width > wrapWidth && i > rowStart) {
             rowStart = breakAfterSpace > rowStart ? breakAfterSpace : i;
             rows[count++] = rowStart;
-            column = LayoutAdvance(text, rowStart, i, 0);
+            x = LayoutAdvance(metrics, text, rowStart, i, 0);
             breakAfterSpace = rowStart;
-            width = LayoutCharColumns(ch, column);
+            width = LayoutCharWidth(metrics, ch, x);
         }
-        column += width;
+        x += width;
         if (space) {
             breakAfterSpace = i + 1;
         }

@@ -11,6 +11,9 @@
  */
 #define TEXTVIEW_CLASS L"QuickPadTextView"
 
+/* WM_COMMAND notification code; see TextViewNotifySelection. */
+#define TEXTVIEW_SELECTION_CHANGED 0x0701
+
 typedef struct TextViewColors {
     COLORREF text;
     COLORREF background;
@@ -36,16 +39,29 @@ BOOL TextViewIsModified(HWND view);
 void TextViewMarkSaved(HWND view);
 
 /*
- * The font stays owned by the caller. Text is laid out in equal cells; with a proportional font a
- * cell is the average width of its letters and digits.
+ * The font stays owned by the caller and must outlive the views that use it. Proportional fonts are
+ * laid out with the width of each glyph.
  */
 void TextViewSetFont(HWND view, HFONT font);
+/* Tab stops every cells average character widths; the views of one font share the setting. */
+void TextViewSetTabSize(HWND view, int cells);
+/* Enter repeats the spaces and tabs the current line starts with. */
+void TextViewSetAutoIndent(HWND view, BOOL autoIndent);
+/* Sends the parent WM_COMMAND with TEXTVIEW_SELECTION_CHANGED whenever the caret or selection moves. */
+void TextViewNotifySelection(HWND view, BOOL notify);
 void TextViewSetWordWrap(HWND view, BOOL wrap);
 
 void TextViewGetSelection(HWND view, size_t *start, size_t *end);
 void TextViewSetSelection(HWND view, size_t anchor, size_t caret);
 size_t TextViewLineCount(HWND view);
 size_t TextViewCaretLine(HWND view);
+size_t TextViewCaretPosition(HWND view);
+size_t TextViewLineStart(HWND view, size_t line);
+/* Position of the line's line break, or the text length for the last line. */
+size_t TextViewLineEnd(HWND view, size_t line);
+size_t TextViewLineFromPosition(HWND view, size_t position);
+/* Replaces [start, end) with text (L'\n' line breaks) as one undo step and puts the caret after it. */
+BOOL TextViewReplaceRange(HWND view, size_t start, size_t end, const wchar_t *text, size_t length);
 void TextViewGoToLine(HWND view, size_t line);
 
 BOOL TextViewCanUndo(HWND view);
