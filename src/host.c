@@ -212,11 +212,30 @@ static BOOL CreateHostWindow(HINSTANCE instance)
     return TRUE;
 }
 
+/*
+ * The host sleeps nearly all the time and has to answer at once when woken, so it asks Windows not to
+ * treat it as background work: no power throttling (EcoQoS), a priority above normal, and a working set
+ * Windows does not trim below 64 MB, which keeps its code and pooled windows in memory while idle.
+ * Each request is a hint; a system that refuses one simply runs the host without it.
+ */
+static void RequestResponsiveness(void)
+{
+    HANDLE process = GetCurrentProcess();
+    PROCESS_POWER_THROTTLING_STATE throttling = { PROCESS_POWER_THROTTLING_CURRENT_VERSION };
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetProcessInformation(process, ProcessPowerThrottling, &throttling, sizeof throttling);
+    SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS);
+    SetProcessWorkingSetSizeEx(process, 64 * 1024 * 1024, 1024 * 1024 * 1024,
+        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+}
+
 int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, size_t count)
 {
     HINSTANCE instance = GetModuleHandleW(NULL);
     if (resident) {
         ResetEvent(readyEvent);
+        RequestResponsiveness();
     }
     if (!EditorInitialize(instance)) {
         return 1;
