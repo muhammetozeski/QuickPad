@@ -116,7 +116,7 @@ if ($Test) {
     }
 
     # Development tools that are built but not run here.
-    foreach ($name in @('snapshot')) {
+    foreach ($name in @('snapshot', 'command')) {
         Invoke-Tool cl.exe ($testFlags + @("$root\tests\$name.c", "/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib'))
     }
 
