@@ -115,6 +115,11 @@ if ($Test) {
         Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib', 'imm32.lib'))
     }
 
+    # Development tools that are built but not run here.
+    foreach ($name in @('snapshot')) {
+        Invoke-Tool cl.exe ($testFlags + @("$root\tests\$name.c", "/Fe$bin\$name.exe", '/link', 'user32.lib', 'gdi32.lib'))
+    }
+
     foreach ($name in $unitTests.Keys) {
         Write-Host "Running $name"
         & "$bin\$name.exe"
