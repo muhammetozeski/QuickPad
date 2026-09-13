@@ -78,7 +78,7 @@ $linkerFlags = @(
     '/STACK:0x100000,0x100000', '/DYNAMICBASE', '/NXCOMPAT', '/HIGHENTROPYVA', '/MANIFEST:NO',
     "/OUT:$bin\QuickPad.exe"
 )
-$libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib')
+$libraries = @('kernel32.lib', 'user32.lib', 'gdi32.lib', 'ntdll.lib')
 Invoke-Tool link.exe ($linkerFlags + $objects + $libraries)
 
 Write-Host "Built $bin\QuickPad.exe"
@@ -92,8 +92,20 @@ if ($Test) {
         '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', "/I$root\src",
         "/Fo$testObj\", "/Fd$testObj\"
     )
-    Invoke-Tool cl.exe ($testFlags + @("$root\tests\text_tests.c", "$root\src\text.c", "/Fe$bin\text_tests.exe"))
 
-    & "$bin\text_tests.exe"
-    if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed.' }
+    # Each test program and the sources it tests.
+    $unitTests = [ordered]@{
+        'text_tests'     = @('text.c')
+        'document_tests' = @('document.c')
+    }
+    foreach ($name in $unitTests.Keys) {
+        $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })
+        Invoke-Tool cl.exe ($testFlags + $testSources + @("/Fe$bin\$name.exe"))
+    }
+
+    foreach ($name in $unitTests.Keys) {
+        Write-Host "Running $name"
+        & "$bin\$name.exe"
+        if ($LASTEXITCODE -ne 0) { throw "$name failed." }
+    }
 }
