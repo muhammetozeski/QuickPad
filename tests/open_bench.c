@@ -1,20 +1,34 @@
 /*
  * Development tool: measures how long QuickPad takes to show a file.
  *
- *     open_bench <QuickPad.exe> <file> [runs] [--pool N]
+ *     open_bench <QuickPad.exe> <file> [runs] [--pool N] [--shell | --com]
  *
  * Each run starts the executable with the file and waits for a top-level window whose title holds
  * the file name to become visible (shown or uncloaked, and not cloaked). It then asks that window
  * to close and waits until it is hidden or cloaked again. With --pool N the tool first waits until
  * N QuickPad editor windows exist, so the runs measure a warm pool.
+ *
+ * --shell opens the file through ShellExecuteExW and its association. Use it only for a file type
+ * QuickPad is already the default for: Windows asks the user to pick an app for any other type.
+ * --com does what Explorer does once the association names QuickPad's open command: it loads the
+ * command from QuickPadShell.dll through COM, hands it the file and executes it, without touching
+ * any association. QuickPad.exe --register must have been run.
  */
+#define COBJMACROS
+
 #include <windows.h>
 #include <dwmapi.h>
+#include <objbase.h>
+#include <shellapi.h>
+#include <shobjidl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 
 #define EDITOR_CLASS L"QuickPadEditor"
+
+/* QUICKPAD_OPEN_COMMAND_CLSID from src/shellid.h. */
+static const CLSID openCommandClass = { 0x0DAFC6E1, 0xFF1B, 0x4AA1, { 0x9E, 0x0F, 0xBF, 0x6D, 0x3F, 0xAC, 0xA6, 0xDB } };
 
 static LARGE_INTEGER frequency;
 static const wchar_t *fileName;
@@ -141,11 +155,18 @@ int wmain(int argc, wchar_t **argv)
     const wchar_t *file = argv[2];
     int runs = argc > 3 && argv[3][0] != L'-' ? _wtoi(argv[3]) : 5;
     int pool = 0;
-    for (int i = 3; i + 1 < argc; ++i) {
-        if (wcscmp(argv[i], L"--pool") == 0) {
+    BOOL shell = FALSE;
+    BOOL com = FALSE;
+    for (int i = 3; i < argc; ++i) {
+        if (wcscmp(argv[i], L"--pool") == 0 && i + 1 < argc) {
             pool = _wtoi(argv[i + 1]);
+        } else if (wcscmp(argv[i], L"--shell") == 0) {
+            shell = TRUE;
+        } else if (wcscmp(argv[i], L"--com") == 0) {
+            com = TRUE;
         }
     }
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     fileName = wcsrchr(file, L'\\') != NULL ? wcsrchr(file, L'\\') + 1 : file;
 
     if (pool > 0) {
@@ -172,21 +193,66 @@ int wmain(int argc, wchar_t **argv)
         foregroundAt = 0;
         titledWindow = NULL;
 
-        size_t commandLength = wcslen(executable) + wcslen(file) + 8;
-        wchar_t *commandLine = malloc(commandLength * sizeof(wchar_t));
-        swprintf(commandLine, commandLength, L"\"%s\" \"%s\"", executable, file);
-        STARTUPINFOW startup = { sizeof startup };
-        PROCESS_INFORMATION process;
-        double started = Now();
-        if (!CreateProcessW(NULL, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
-            fwprintf(stderr, L"CreateProcess failed: %lu\n", GetLastError());
-            return 1;
+        PROCESS_INFORMATION process = { 0 };
+        IShellItemArray *items = NULL;
+        if (com) {
+            IShellItem *item = NULL;
+            if (FAILED(SHCreateItemFromParsingName(file, NULL, &IID_IShellItem, (void **)&item))
+                || FAILED(SHCreateShellItemArrayFromShellItem(item, &IID_IShellItemArray, (void **)&items))) {
+                fwprintf(stderr, L"cannot create a shell item for %s\n", file);
+                return 1;
+            }
+            IShellItem_Release(item);
         }
-        free(commandLine);
+        double started = Now();
+        if (com) {
+            IExecuteCommand *command = NULL;
+            HRESULT result = CoCreateInstance(&openCommandClass, NULL, CLSCTX_INPROC_SERVER, &IID_IExecuteCommand, (void **)&command);
+            if (FAILED(result)) {
+                fwprintf(stderr, L"CoCreateInstance failed: 0x%08lx\n", (unsigned long)result);
+                return 1;
+            }
+            double created = Now();
+            IObjectWithSelection *selection = NULL;
+            if (SUCCEEDED(IExecuteCommand_QueryInterface(command, &IID_IObjectWithSelection, (void **)&selection))) {
+                IObjectWithSelection_SetSelection(selection, items);
+                IObjectWithSelection_Release(selection);
+            }
+            double selected = Now();
+            result = IExecuteCommand_Execute(command);
+            double executed = Now();
+            IExecuteCommand_Release(command);
+            IShellItemArray_Release(items);
+            wprintf(L"run %d: COM create %.2f, selection %.2f, execute 0x%08lx %.2f, release %.2f ms\n", run + 1,
+                created - started, selected - created, (unsigned long)result, executed - selected, Now() - executed);
+        } else if (shell) {
+            SHELLEXECUTEINFOW info = { sizeof info };
+            info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS;
+            info.lpVerb = L"open";
+            info.lpFile = file;
+            info.nShow = SW_SHOWNORMAL;
+            if (!ShellExecuteExW(&info)) {
+                fwprintf(stderr, L"ShellExecuteEx failed: %lu\n", GetLastError());
+                return 1;
+            }
+            wprintf(L"run %d: ShellExecuteEx returned after %.2f ms%s\n", run + 1, Now() - started,
+                info.hProcess != NULL ? L" with a new process" : L" without a new process");
+            process.hProcess = info.hProcess;
+        } else {
+            size_t commandLength = wcslen(executable) + wcslen(file) + 8;
+            wchar_t *commandLine = malloc(commandLength * sizeof(wchar_t));
+            swprintf(commandLine, commandLength, L"\"%s\" \"%s\"", executable, file);
+            STARTUPINFOW startup = { sizeof startup };
+            if (!CreateProcessW(NULL, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+                fwprintf(stderr, L"CreateProcess failed: %lu\n", GetLastError());
+                return 1;
+            }
+            free(commandLine);
+        }
 
         BOOL shown = PumpUntil(WindowShown, 10000);
         double launcherExit = -1;
-        if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) {
+        if (process.hProcess != NULL && WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) {
             FILETIME creation, exit, kernel, user;
             GetProcessTimes(process.hProcess, &creation, &exit, &kernel, &user);
             ULARGE_INTEGER a = { .LowPart = creation.dwLowDateTime, .HighPart = creation.dwHighDateTime };
@@ -218,9 +284,13 @@ int wmain(int argc, wchar_t **argv)
             PostMessageW(shownWindow, WM_CLOSE, 0, 0);
             PumpUntil(WindowGone, 10000);
         }
-        WaitForSingleObject(process.hProcess, 10000);
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        if (process.hProcess != NULL) {
+            WaitForSingleObject(process.hProcess, 10000);
+            CloseHandle(process.hProcess);
+        }
+        if (process.hThread != NULL) {
+            CloseHandle(process.hThread);
+        }
         if (pool > 0) {
             DWORD start = GetTickCount();
             while (CountEditors() < pool && GetTickCount() - start < 10000) {
