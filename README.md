@@ -17,12 +17,15 @@ libraries that are part of Windows.
 ## Features
 
 **Editing**
-- New, Open (several files at once), Save, Save As with a choice of encoding, Close
+- New, Open (several files at once), Reload from Disk, Save, Save As with a choice of encoding, Close
+- Files dropped on a window are opened
 - Undo and redo; consecutive typing, backspaces and deletes are undone as one step
 - Cut, copy, paste, delete, select all, and a context menu in the text area
 - Find, Find Next, Find Previous, Replace and Replace All, with match case and whole word options
-- Go To Line
-- Word wrap
+- Go To Line, insert time and date
+- Duplicate, delete, move up, move down and join lines
+- Uppercase and lowercase following the user's language, trim trailing whitespace
+- Word wrap, optional auto indent, tab size 2, 4 or 8
 - Word-wise caret movement and deletion with Ctrl, double-click word selection, drag selection that
   scrolls past the window edge, vertical and horizontal mouse wheel
 - Input method editor support for languages such as Chinese and Japanese
@@ -30,7 +33,9 @@ libraries that are part of Windows.
 **Files**
 - Detects UTF-8 and UTF-16 (little and big endian, with or without a byte order mark) and falls back
   to the system ANSI code page
-- Saves in the file's own encoding and line ending style (CRLF, LF or CR)
+- Saves in the file's own encoding and line ending style (CRLF, LF or CR); both can be changed from
+  the Format menu for the next save
+- Open Containing Folder and Copy Full Path
 - Writes to a temporary file first and swaps it in, so a failed save leaves the original intact
 - Files of 1 MB and more are memory mapped while loading
 - Asks before discarding unsaved changes; a modified document shows `*` in the title
@@ -47,8 +52,15 @@ libraries that are part of Windows.
 
 **Appearance**
 - Always dark: title bar, menu bar, scroll bars, text area and dialogs
-- Comic Sans MS as the editor font, with Courier New where it is not installed
+- Comic Sans MS by default, with Courier New where it is not installed; any font can be chosen, and
+  proportional fonts are laid out with the width of each glyph
+- Text size from 10 to 500 percent with Ctrl+Plus, Ctrl+Minus, Ctrl+0 or Ctrl and the mouse wheel
+- Optional status bar with line, column, text size, line ending and encoding
+- Always on top and full screen
 - Window size is remembered
+
+Features that are not used cost nothing: the status bar is off until it is turned on, auto indent is
+off, and a window's menus are built from one shared template the first time they are opened.
 
 ## Security Architecture
 
@@ -108,7 +120,12 @@ shown for downloaded programs that are not yet widely used.
 | Ctrl+Z, Ctrl+Y | Undo, Redo |
 | Ctrl+F, F3, Shift+F3 | Find, Find Next, Find Previous |
 | Ctrl+H, Ctrl+G | Replace, Go To Line |
-| Ctrl+A | Select All |
+| Ctrl+A, F5 | Select All, Time/Date |
+| Ctrl+D, Ctrl+Shift+K, Ctrl+J | Duplicate Line, Delete Line, Join Lines |
+| Alt+Up, Alt+Down | Move Line Up, Move Line Down |
+| Ctrl+Shift+U, Ctrl+U | Uppercase, Lowercase |
+| Ctrl+Plus, Ctrl+Minus, Ctrl+0, Ctrl+wheel | Zoom In, Zoom Out, Restore Default Zoom |
+| F11 | Full Screen |
 
 ## Building
 
@@ -131,7 +148,7 @@ The running host locks `bin\QuickPad.exe`; exit it from the notification area me
 | `src/host.c` | Resident host window, notification area icon, message loop |
 | `src/editor.c` | Editor windows, window pool, menus, file dialogs, find and replace |
 | `src/textview.c` | The text editing control |
-| `src/document.c`, `layout.c`, `history.c`, `search.c` | Gap buffer with line index, column layout and word wrap, undo history, search |
+| `src/document.c`, `layout.c`, `history.c`, `search.c` | Gap buffer with line index, glyph width layout and word wrap, undo history, search |
 | `src/text.c`, `fileio.c` | Encoding detection and conversion, reading and saving files |
 | `src/register.c`, `startup.c`, `settings.c`, `theme.c` | File associations, start with Windows, `QuickPad.ini`, dark theme |
 | `src/lazyload.c`, `nocrt.c` | On-demand binding of system libraries, memory functions without the C runtime |
