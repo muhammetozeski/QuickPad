@@ -1,18 +1,20 @@
 /*
  * Development tool: measures how long QuickPad takes to show a file.
  *
- *     open_bench <QuickPad.exe> <file> [runs] [--pool N] [--shell | --com]
+ *     open_bench <QuickPad.exe> <file> [runs] [--pool N] [--interval ms] [--shell | --com | --dll path]
  *
  * Each run starts the executable with the file and waits for a top-level window whose title holds
  * the file name to become visible (shown or uncloaked, and not cloaked). It then asks that window
  * to close and waits until it is hidden or cloaked again. With --pool N the tool first waits until
- * N QuickPad editor windows exist, so the runs measure a warm pool.
+ * N QuickPad editor windows exist, so the runs measure a warm pool. --interval waits that many
+ * milliseconds between runs instead of waiting for the pool to be full again.
  *
  * --shell opens the file through ShellExecuteExW and its association. Use it only for a file type
  * QuickPad is already the default for: Windows asks the user to pick an app for any other type.
  * --com does what Explorer does once the association names QuickPad's open command: it loads the
  * command from QuickPadShell.dll through COM, hands it the file and executes it, without touching
- * any association. QuickPad.exe --register must have been run.
+ * any association. QuickPad.exe --register must have been run. --dll <path> does the same with the
+ * class factory of the given QuickPadShell.dll, loaded directly, so no registration is needed.
  */
 #define COBJMACROS
 
@@ -157,6 +159,8 @@ int wmain(int argc, wchar_t **argv)
     int pool = 0;
     BOOL shell = FALSE;
     BOOL com = FALSE;
+    const wchar_t *dllPath = NULL;
+    int interval = -1;
     for (int i = 3; i < argc; ++i) {
         if (wcscmp(argv[i], L"--pool") == 0 && i + 1 < argc) {
             pool = _wtoi(argv[i + 1]);
@@ -164,8 +168,15 @@ int wmain(int argc, wchar_t **argv)
             shell = TRUE;
         } else if (wcscmp(argv[i], L"--com") == 0) {
             com = TRUE;
+        } else if (wcscmp(argv[i], L"--interval") == 0 && i + 1 < argc) {
+            interval = _wtoi(argv[i + 1]);
+        } else if (wcscmp(argv[i], L"--dll") == 0 && i + 1 < argc) {
+            dllPath = argv[i + 1];
+            com = TRUE;
         }
     }
+    HMODULE shellModule = NULL;
+    LPFNGETCLASSOBJECT getClassObject = NULL;
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     fileName = wcsrchr(file, L'\\') != NULL ? wcsrchr(file, L'\\') + 1 : file;
 
@@ -207,7 +218,20 @@ int wmain(int argc, wchar_t **argv)
         double started = Now();
         if (com) {
             IExecuteCommand *command = NULL;
-            HRESULT result = CoCreateInstance(&openCommandClass, NULL, CLSCTX_INPROC_SERVER, &IID_IExecuteCommand, (void **)&command);
+            HRESULT result = E_FAIL;
+            if (dllPath != NULL) {
+                if (shellModule == NULL) {
+                    shellModule = LoadLibraryW(dllPath);
+                    getClassObject = shellModule != NULL ? (LPFNGETCLASSOBJECT)GetProcAddress(shellModule, "DllGetClassObject") : NULL;
+                }
+                IClassFactory *factory = NULL;
+                if (getClassObject != NULL && SUCCEEDED(result = getClassObject(&openCommandClass, &IID_IClassFactory, (void **)&factory))) {
+                    result = IClassFactory_CreateInstance(factory, NULL, &IID_IExecuteCommand, (void **)&command);
+                    IClassFactory_Release(factory);
+                }
+            } else {
+                result = CoCreateInstance(&openCommandClass, NULL, CLSCTX_INPROC_SERVER, &IID_IExecuteCommand, (void **)&command);
+            }
             if (FAILED(result)) {
                 fwprintf(stderr, L"CoCreateInstance failed: 0x%08lx\n", (unsigned long)result);
                 return 1;
@@ -291,7 +315,9 @@ int wmain(int argc, wchar_t **argv)
         if (process.hThread != NULL) {
             CloseHandle(process.hThread);
         }
-        if (pool > 0) {
+        if (interval >= 0) {
+            Sleep((DWORD)interval);
+        } else if (pool > 0) {
             DWORD start = GetTickCount();
             while (CountEditors() < pool && GetTickCount() - start < 10000) {
                 Sleep(20);
