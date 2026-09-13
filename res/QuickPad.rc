@@ -43,8 +43,12 @@ BEGIN
     BEGIN
         MENUITEM "&New\tCtrl+N",            IDM_FILE_NEW
         MENUITEM "&Open...\tCtrl+O",        IDM_FILE_OPEN
+        MENUITEM "&Reload from Disk",       IDM_FILE_RELOAD
         MENUITEM "&Save\tCtrl+S",           IDM_FILE_SAVE
         MENUITEM "Save &As...\tCtrl+Shift+S", IDM_FILE_SAVE_AS
+        MENUITEM SEPARATOR
+        MENUITEM "Open Containing &Folder", IDM_FILE_OPEN_FOLDER
+        MENUITEM "Copy Full &Path",         IDM_FILE_COPY_PATH
         MENUITEM SEPARATOR
         MENUITEM "&Close\tCtrl+W",          IDM_FILE_CLOSE
     END
@@ -65,10 +69,54 @@ BEGIN
         MENUITEM "&Go To...\tCtrl+G",       IDM_EDIT_GOTO
         MENUITEM SEPARATOR
         MENUITEM "Select &All\tCtrl+A",     IDM_EDIT_SELECT_ALL
+        MENUITEM "Time/&Date\tF5",          IDM_EDIT_TIME_DATE
+        MENUITEM SEPARATOR
+        MENUITEM "D&uplicate Line\tCtrl+D", IDM_EDIT_DUPLICATE_LINE
+        MENUITEM "Delete L&ine\tCtrl+Shift+K", IDM_EDIT_DELETE_LINE
+        MENUITEM "Move Line U&p\tAlt+Up",   IDM_EDIT_MOVE_LINE_UP
+        MENUITEM "Move Line Do&wn\tAlt+Down", IDM_EDIT_MOVE_LINE_DOWN
+        MENUITEM "&Join Lines\tCtrl+J",     IDM_EDIT_JOIN_LINES
+        MENUITEM SEPARATOR
+        MENUITEM "UPPER&CASE\tCtrl+Shift+U", IDM_EDIT_UPPERCASE
+        MENUITEM "&lowercase\tCtrl+U",      IDM_EDIT_LOWERCASE
+        MENUITEM "Trim Trailing &Whitespace", IDM_EDIT_TRIM_WHITESPACE
     END
     POPUP "F&ormat"
     BEGIN
         MENUITEM "&Word Wrap",              IDM_FORMAT_WORD_WRAP
+        MENUITEM "&Auto Indent",            IDM_FORMAT_AUTO_INDENT
+        MENUITEM "&Font...",                IDM_FORMAT_FONT
+        MENUITEM SEPARATOR
+        POPUP "&Tab Size"
+        BEGIN
+            MENUITEM "&2",                  IDM_FORMAT_TAB_2
+            MENUITEM "&4",                  IDM_FORMAT_TAB_4
+            MENUITEM "&8",                  IDM_FORMAT_TAB_8
+        END
+        POPUP "&Line Ending"
+        BEGIN
+            MENUITEM "&Windows (CRLF)",     IDM_FORMAT_CRLF
+            MENUITEM "&Unix (LF)",          IDM_FORMAT_LF
+            MENUITEM "&Macintosh (CR)",     IDM_FORMAT_CR
+        END
+        POPUP "&Encoding"
+        BEGIN
+            MENUITEM "UTF-&8",              IDM_FORMAT_UTF8
+            MENUITEM "UTF-8 with &BOM",     IDM_FORMAT_UTF8_BOM
+            MENUITEM "UTF-16 &LE",          IDM_FORMAT_UTF16LE
+            MENUITEM "UTF-16 B&E",          IDM_FORMAT_UTF16BE
+            MENUITEM "&ANSI",               IDM_FORMAT_ANSI
+        END
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "Zoom &In\tCtrl+Plus",     IDM_VIEW_ZOOM_IN
+        MENUITEM "Zoom &Out\tCtrl+Minus",   IDM_VIEW_ZOOM_OUT
+        MENUITEM "&Restore Default Zoom\tCtrl+0", IDM_VIEW_ZOOM_RESET
+        MENUITEM SEPARATOR
+        MENUITEM "&Status Bar",             IDM_VIEW_STATUS_BAR
+        MENUITEM "Always on &Top",          IDM_VIEW_ALWAYS_ON_TOP
+        MENUITEM "&Full Screen\tF11",       IDM_VIEW_FULL_SCREEN
     END
     POPUP "&Settings"
     BEGIN
@@ -111,4 +159,19 @@ BEGIN
     VK_F3,  IDM_EDIT_FIND_PREVIOUS, VIRTKEY, SHIFT
     "H",    IDM_EDIT_REPLACE,   VIRTKEY, CONTROL
     "G",    IDM_EDIT_GOTO,      VIRTKEY, CONTROL
+    VK_F5,  IDM_EDIT_TIME_DATE, VIRTKEY
+    "D",    IDM_EDIT_DUPLICATE_LINE, VIRTKEY, CONTROL
+    "K",    IDM_EDIT_DELETE_LINE, VIRTKEY, CONTROL, SHIFT
+    VK_UP,  IDM_EDIT_MOVE_LINE_UP, VIRTKEY, ALT
+    VK_DOWN, IDM_EDIT_MOVE_LINE_DOWN, VIRTKEY, ALT
+    "J",    IDM_EDIT_JOIN_LINES, VIRTKEY, CONTROL
+    "U",    IDM_EDIT_UPPERCASE, VIRTKEY, CONTROL, SHIFT
+    "U",    IDM_EDIT_LOWERCASE, VIRTKEY, CONTROL
+    VK_OEM_PLUS, IDM_VIEW_ZOOM_IN, VIRTKEY, CONTROL
+    VK_ADD, IDM_VIEW_ZOOM_IN,   VIRTKEY, CONTROL
+    VK_OEM_MINUS, IDM_VIEW_ZOOM_OUT, VIRTKEY, CONTROL
+    VK_SUBTRACT, IDM_VIEW_ZOOM_OUT, VIRTKEY, CONTROL
+    "0",    IDM_VIEW_ZOOM_RESET, VIRTKEY, CONTROL
+    VK_NUMPAD0, IDM_VIEW_ZOOM_RESET, VIRTKEY, CONTROL
+    VK_F11, IDM_VIEW_FULL_SCREEN, VIRTKEY
 END

@@ -12,9 +12,13 @@
 
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 
 #define EDITOR_CLASS L"QuickPadEditor"
+#define STATUS_CLASS L"QuickPadStatus"
+#define STATUS_BACKGROUND RGB(32, 32, 32)
+#define STATUS_TEXT RGB(200, 200, 200)
 #define VIEW_ID 1
 #define ENCODING_GROUP 100
 #define ENCODING_COMBO 101
@@ -47,13 +51,21 @@ typedef struct Editor {
     HWND view;
     wchar_t *path;
     TextFormat format;
+    BOOL formatChanged;      /* line ending or encoding changed from the menu since the last save */
     BOOL modifiedShown;
     BOOL shown;
     BOOL pooled;
+    BOOL topmost;
+    BOOL fullScreen;
+    LONG_PTR savedStyle;
+    WINDOWPLACEMENT savedPlacement;
+    HWND status;             /* created only while the status bar is on */
+    wchar_t statusText[128];
 } Editor;
 
 static HINSTANCE instanceHandle;
 static ATOM editorAtom;
+static HMENU menuTemplate;
 static HACCEL accelerators;
 static HFONT editorFont;
 static Editor *editors;
@@ -89,9 +101,14 @@ static void ShowFileError(const Editor *editor, const wchar_t *path, DWORD error
     }
 }
 
+static BOOL IsDirty(Editor *editor)
+{
+    return editor->formatChanged || TextViewIsModified(editor->view);
+}
+
 static void UpdateTitle(Editor *editor)
 {
-    BOOL modified = TextViewIsModified(editor->view);
+    BOOL modified = IsDirty(editor);
     wchar_t *title = StringJoin(modified ? L"*" : L"", editor->path != NULL ? PathFileName(editor->path) : L"Untitled",
         L" - " QP_APP_NAME);
     if (title != NULL) {
@@ -224,6 +241,51 @@ static void ParkEditor(Editor *editor)
     editor->pooled = TRUE;
 }
 
+/*
+ * A window gets only the titles of its menus; each menu is filled from the one shared template the
+ * first time it opens, so creating a window does not build every menu item.
+ */
+static HMENU CreateMenuBar(void)
+{
+    HMENU bar = CreateMenu();
+    int count = menuTemplate != NULL ? GetMenuItemCount(menuTemplate) : 0;
+    for (int i = 0; bar != NULL && i < count; ++i) {
+        wchar_t title[64];
+        HMENU popup = CreatePopupMenu();
+        if (popup != NULL && GetMenuStringW(menuTemplate, (UINT)i, title, ARRAYSIZE(title), MF_BYPOSITION) > 0) {
+            AppendMenuW(bar, MF_POPUP | MF_STRING, (UINT_PTR)popup, title);
+        }
+    }
+    return bar;
+}
+
+static void CopyMenuItems(HMENU source, HMENU target)
+{
+    int count = GetMenuItemCount(source);
+    for (int i = 0; i < count; ++i) {
+        wchar_t text[128];
+        MENUITEMINFOW info = { sizeof info };
+        info.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
+        info.dwTypeData = text;
+        info.cch = ARRAYSIZE(text);
+        if (!GetMenuItemInfoW(source, (UINT)i, TRUE, &info)) {
+            continue;
+        }
+        if ((info.fType & MFT_SEPARATOR) != 0) {
+            info.fMask = MIIM_FTYPE;
+        } else if (info.hSubMenu != NULL) {
+            HMENU submenu = CreatePopupMenu();
+            if (submenu == NULL) {
+                continue;
+            }
+            CopyMenuItems(info.hSubMenu, submenu);
+            info.hSubMenu = submenu;
+        }
+        info.dwTypeData = text;
+        InsertMenuItemW(target, (UINT)i, TRUE, &info);
+    }
+}
+
 static Editor *CreateEditor(void)
 {
     Editor *editor = MemAllocZero(sizeof *editor);
@@ -234,8 +296,8 @@ static Editor *CreateEditor(void)
 
     RECT work = WorkArea();
     SIZE size = WindowSize(&work);
-    HMENU menu = LoadMenuW(instanceHandle, MAKEINTRESOURCEW(IDR_MENU));
-    HWND window = CreateWindowExW(0, EDITOR_CLASS, L"Untitled - " QP_APP_NAME, WS_OVERLAPPEDWINDOW,
+    HMENU menu = CreateMenuBar();
+    HWND window = CreateWindowExW(WS_EX_ACCEPTFILES, EDITOR_CLASS, L"Untitled - " QP_APP_NAME, WS_OVERLAPPEDWINDOW,
         PARK_POSITION, PARK_POSITION, size.cx, size.cy, ownerWindow, menu, instanceHandle, editor);
     if (window == NULL) {
         if (menu != NULL) {
@@ -297,6 +359,15 @@ static void CloseEditor(Editor *editor)
 {
     HWND window = editor->window;
     lastWindowChange = GetTickCount64();
+    if (editor->fullScreen) {
+        SetWindowLongPtrW(window, GWL_STYLE, editor->savedStyle);
+        SetWindowPlacement(window, &editor->savedPlacement);
+        editor->fullScreen = FALSE;
+    }
+    if (editor->topmost) {
+        SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        editor->topmost = FALSE;
+    }
     if (findDialog != NULL && findData.hwndOwner == window) {
         DestroyWindow(findDialog);
         findDialog = NULL;
@@ -324,6 +395,7 @@ static void CloseEditor(Editor *editor)
     TextViewClear(editor->view);
     SetPath(editor, NULL);
     editor->format = TextDefaultFormat();
+    editor->formatChanged = FALSE;
     UpdateTitle(editor);
     ParkEditor(editor);
 }
@@ -357,6 +429,7 @@ static BOOL LoadInto(Editor *editor, const wchar_t *path)
 
     SetPath(editor, path);
     editor->format = format;
+    editor->formatChanged = FALSE;
     UpdateTitle(editor);
     return TRUE;
 }
@@ -479,6 +552,7 @@ static BOOL SaveTo(Editor *editor, const wchar_t *path, TextFormat format)
         SetPath(editor, path);
     }
     editor->format = format;
+    editor->formatChanged = FALSE;
     TextViewMarkSaved(editor->view);
     UpdateTitle(editor);
     return TRUE;
@@ -561,7 +635,7 @@ static BOOL Save(Editor *editor)
 /* Offers to save unsaved changes; FALSE when the user cancels. */
 static BOOL ConfirmDiscard(Editor *editor)
 {
-    if (!TextViewIsModified(editor->view)) {
+    if (!IsDirty(editor)) {
         return TRUE;
     }
     SetForegroundWindow(editor->window);
@@ -588,6 +662,20 @@ static void UpdateMenu(Editor *editor, HMENU menu)
     EnableMenuItem(menu, IDM_EDIT_DELETE, selection);
     EnableMenuItem(menu, IDM_EDIT_PASTE, TextViewCanPaste(editor->view) ? MF_ENABLED : MF_GRAYED);
     CheckMenuItem(menu, IDM_FORMAT_WORD_WRAP, settings.wordWrap ? MF_CHECKED : MF_UNCHECKED);
+    UINT hasPath = editor->path != NULL ? MF_ENABLED : MF_GRAYED;
+    EnableMenuItem(menu, IDM_FILE_RELOAD, hasPath);
+    EnableMenuItem(menu, IDM_FILE_OPEN_FOLDER, hasPath);
+    EnableMenuItem(menu, IDM_FILE_COPY_PATH, hasPath);
+    EnableMenuItem(menu, IDM_EDIT_UPPERCASE, selection);
+    EnableMenuItem(menu, IDM_EDIT_LOWERCASE, selection);
+    CheckMenuItem(menu, IDM_FORMAT_AUTO_INDENT, settings.autoIndent ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuRadioItem(menu, IDM_FORMAT_TAB_2, IDM_FORMAT_TAB_8,
+        settings.tabSize == 2 ? IDM_FORMAT_TAB_2 : settings.tabSize == 4 ? IDM_FORMAT_TAB_4 : IDM_FORMAT_TAB_8, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, IDM_FORMAT_CRLF, IDM_FORMAT_CR, IDM_FORMAT_CRLF + (UINT)editor->format.lineEnding, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, IDM_FORMAT_UTF8, IDM_FORMAT_ANSI, IDM_FORMAT_UTF8 + ChoiceFromFormat(editor->format), MF_BYCOMMAND);
+    CheckMenuItem(menu, IDM_VIEW_STATUS_BAR, settings.statusBar ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, IDM_VIEW_ALWAYS_ON_TOP, editor->topmost ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, IDM_VIEW_FULL_SCREEN, editor->fullScreen ? MF_CHECKED : MF_UNCHECKED);
     if (GetMenuState(menu, IDM_START_WITH_WINDOWS, MF_BYCOMMAND) != (UINT)-1) {
         CheckMenuItem(menu, IDM_START_WITH_WINDOWS, StartupIsEnabled() ? MF_CHECKED : MF_UNCHECKED);
     }
@@ -734,6 +822,537 @@ static INT_PTR CALLBACK GoToProc(HWND dialog, UINT message, WPARAM wParam, LPARA
     return FALSE;
 }
 
+/* ---- Status bar, text size and window commands --------------------------------------------- */
+
+static HFONT CreateEditorFont(void);
+
+static HFONT statusFont;
+static int statusHeight;
+static BOOL statusClassReady;
+
+static LRESULT CALLBACK StatusProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_ERASEBKGND) {
+        return 1;
+    }
+    if (message != WM_PAINT) {
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+    const Editor *editor = (const Editor *)GetWindowLongPtrW(window, GWLP_USERDATA);
+    PAINTSTRUCT paint;
+    HDC dc = BeginPaint(window, &paint);
+    RECT client;
+    GetClientRect(window, &client);
+    SetBkColor(dc, STATUS_BACKGROUND);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &client, NULL, 0, NULL);
+    if (editor != NULL) {
+        HGDIOBJ previous = SelectObject(dc, statusFont);
+        SetTextColor(dc, STATUS_TEXT);
+        SetBkMode(dc, TRANSPARENT);
+        client.right -= GetSystemMetrics(SM_CXVSCROLL);
+        DrawTextW(dc, editor->statusText, -1, &client, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, previous);
+    }
+    EndPaint(window, &paint);
+    return 0;
+}
+
+/* The status bar class and font are made the first time a status bar is turned on. */
+static BOOL PrepareStatusBar(void)
+{
+    if (statusClassReady) {
+        return TRUE;
+    }
+    if (statusFont == NULL) {
+        NONCLIENTMETRICSW metrics = { sizeof metrics };
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof metrics, &metrics, 0);
+        statusFont = CreateFontIndirectW(&metrics.lfStatusFont);
+        HDC screen = GetDC(NULL);
+        HGDIOBJ previous = SelectObject(screen, statusFont);
+        TEXTMETRICW text;
+        GetTextMetricsW(screen, &text);
+        SelectObject(screen, previous);
+        ReleaseDC(NULL, screen);
+        statusHeight = text.tmHeight + text.tmHeight / 2;
+    }
+    WNDCLASSEXW windowClass = { sizeof windowClass };
+    windowClass.lpfnWndProc = StatusProc;
+    windowClass.hInstance = instanceHandle;
+    windowClass.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    windowClass.lpszClassName = STATUS_CLASS;
+    statusClassReady = statusFont != NULL && RegisterClassExW(&windowClass) != 0;
+    return statusClassReady;
+}
+
+static const wchar_t *LineEndingName(LineEnding ending)
+{
+    return ending == LINE_ENDING_LF ? L"Unix (LF)" : ending == LINE_ENDING_CR ? L"Macintosh (CR)" : L"Windows (CRLF)";
+}
+
+static void UpdateStatus(Editor *editor)
+{
+    if (editor->status == NULL) {
+        return;
+    }
+    size_t caret = TextViewCaretPosition(editor->view);
+    size_t line = TextViewLineFromPosition(editor->view, caret);
+    size_t column = caret - TextViewLineStart(editor->view, line) + 1;
+    wsprintfW(editor->statusText, L"Ln %lu, Col %lu        %d%%        %s        %s", (unsigned long)(line + 1),
+        (unsigned long)column, settings.zoom, LineEndingName(editor->format.lineEnding), encodingNames[ChoiceFromFormat(editor->format)]);
+    InvalidateRect(editor->status, NULL, FALSE);
+}
+
+static void LayoutEditor(Editor *editor)
+{
+    RECT client;
+    GetClientRect(editor->window, &client);
+    int height = editor->status != NULL ? statusHeight : 0;
+    int viewHeight = client.bottom - height > 0 ? client.bottom - height : 0;
+    MoveWindow(editor->view, 0, 0, client.right, viewHeight, TRUE);
+    if (editor->status != NULL) {
+        MoveWindow(editor->status, 0, viewHeight, client.right, height, TRUE);
+    }
+}
+
+static void ShowStatusBar(Editor *editor, BOOL show)
+{
+    if (show && editor->status == NULL && PrepareStatusBar()) {
+        editor->status = CreateWindowExW(0, STATUS_CLASS, NULL, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, editor->window, NULL,
+            instanceHandle, NULL);
+        if (editor->status != NULL) {
+            SetWindowLongPtrW(editor->status, GWLP_USERDATA, (LONG_PTR)editor);
+        }
+    } else if (!show && editor->status != NULL) {
+        DestroyWindow(editor->status);
+        editor->status = NULL;
+    }
+    TextViewNotifySelection(editor->view, editor->status != NULL);
+    UpdateStatus(editor);
+    LayoutEditor(editor);
+}
+
+static void ToggleStatusBar(void)
+{
+    settings.statusBar = !settings.statusBar;
+    SettingsSave();
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        ShowStatusBar(editor, settings.statusBar);
+    }
+}
+
+/* Every editor shares one font; a new size or face replaces it in all of them. */
+static void ApplyEditorFont(void)
+{
+    HFONT font = CreateEditorFont();
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        TextViewSetFont(editor->view, font);
+        UpdateStatus(editor);
+    }
+    HFONT previous = editorFont;
+    editorFont = font;
+    if (previous != NULL && previous != (HFONT)GetStockObject(ANSI_FIXED_FONT)) {
+        DeleteObject(previous);
+    }
+}
+
+/* steps 0 restores 100 percent; each step is ten percent. */
+static void Zoom(int steps)
+{
+    int zoom = steps == 0 ? 100 : settings.zoom + steps * 10;
+    zoom = zoom < SETTINGS_ZOOM_MIN ? SETTINGS_ZOOM_MIN : zoom > SETTINGS_ZOOM_MAX ? SETTINGS_ZOOM_MAX : zoom;
+    if (zoom != settings.zoom) {
+        settings.zoom = zoom;
+        SettingsSave();
+        ApplyEditorFont();
+    }
+}
+
+static void ChooseEditorFont(Editor *editor)
+{
+    HDC screen = GetDC(NULL);
+    int dpi = GetDeviceCaps(screen, LOGPIXELSY);
+    ReleaseDC(NULL, screen);
+    LOGFONTW font = { 0 };
+    font.lfHeight = -MulDiv(settings.fontSize, dpi, 72);
+    font.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(font.lfFaceName, settings.fontName, LF_FACESIZE);
+
+    CHOOSEFONTW choose = { sizeof choose };
+    choose.hwndOwner = editor->window;
+    choose.lpLogFont = &font;
+    choose.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_NOVERTFONTS | CF_ENABLEHOOK;
+    choose.lpfnHook = FindDialogHook;
+    if (!ChooseFontW(&choose)) {
+        return;
+    }
+    int size = choose.iPointSize / 10;
+    settings.fontSize = size < SETTINGS_FONT_SIZE_MIN ? SETTINGS_FONT_SIZE_MIN : size > SETTINGS_FONT_SIZE_MAX ? SETTINGS_FONT_SIZE_MAX : size;
+    lstrcpynW(settings.fontName, font.lfFaceName, LF_FACESIZE);
+    SettingsSave();
+    ApplyEditorFont();
+}
+
+static void SetTabSize(int cells)
+{
+    settings.tabSize = cells;
+    SettingsSave();
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        TextViewSetTabSize(editor->view, cells);
+    }
+}
+
+static void ToggleAutoIndent(void)
+{
+    settings.autoIndent = !settings.autoIndent;
+    SettingsSave();
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        TextViewSetAutoIndent(editor->view, settings.autoIndent);
+    }
+}
+
+/* The line ending and encoding picked here are used by the next save. */
+static void ChangeFormat(Editor *editor, TextFormat format)
+{
+    if (format.encoding == editor->format.encoding && format.byteOrderMark == editor->format.byteOrderMark
+        && format.lineEnding == editor->format.lineEnding) {
+        return;
+    }
+    editor->format = format;
+    editor->formatChanged = TRUE;
+    UpdateTitle(editor);
+    UpdateStatus(editor);
+}
+
+static void ToggleTopmost(Editor *editor)
+{
+    editor->topmost = !editor->topmost;
+    SetWindowPos(editor->window, editor->topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static void ToggleFullScreen(Editor *editor)
+{
+    HWND window = editor->window;
+    if (editor->fullScreen) {
+        SetWindowLongPtrW(window, GWL_STYLE, editor->savedStyle);
+        SetWindowPlacement(window, &editor->savedPlacement);
+        SetWindowPos(window, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        editor->fullScreen = FALSE;
+        return;
+    }
+    MONITORINFO monitor = { sizeof monitor };
+    editor->savedPlacement.length = sizeof editor->savedPlacement;
+    if (!GetWindowPlacement(window, &editor->savedPlacement)
+        || !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        return;
+    }
+    editor->savedStyle = GetWindowLongPtrW(window, GWL_STYLE);
+    SetWindowLongPtrW(window, GWL_STYLE, editor->savedStyle & ~(LONG_PTR)WS_OVERLAPPEDWINDOW);
+    SetWindowPos(window, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top, monitor.rcMonitor.right - monitor.rcMonitor.left,
+        monitor.rcMonitor.bottom - monitor.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    editor->fullScreen = TRUE;
+}
+
+/* ---- Line and text commands ---------------------------------------------------------------- */
+
+/* The lines the selection touches; a selection ending at the start of a line leaves that line out. */
+static void SelectedLines(Editor *editor, size_t *first, size_t *last)
+{
+    size_t start = 0;
+    size_t end = 0;
+    TextViewGetSelection(editor->view, &start, &end);
+    *first = TextViewLineFromPosition(editor->view, start);
+    *last = TextViewLineFromPosition(editor->view, end);
+    if (*last > *first && end == TextViewLineStart(editor->view, *last)) {
+        --*last;
+    }
+}
+
+/* Replaces [start, end) with the pieces joined, then selects [anchor, caret]. */
+static void ReplaceWithPieces(Editor *editor, size_t start, size_t end, const wchar_t *first, size_t firstLength,
+    const wchar_t *second, size_t secondLength, size_t anchor, size_t caret)
+{
+    wchar_t *text = MemAlloc((firstLength + secondLength + 1) * sizeof(wchar_t));
+    if (text == NULL) {
+        MessageBeep(MB_ICONERROR);
+        return;
+    }
+    memcpy(text, first, firstLength * sizeof(wchar_t));
+    memcpy(text + firstLength, second, secondLength * sizeof(wchar_t));
+    if (TextViewReplaceRange(editor->view, start, end, text, firstLength + secondLength)) {
+        TextViewSetSelection(editor->view, anchor, caret);
+    }
+    MemFree(text);
+}
+
+static void DuplicateLines(Editor *editor)
+{
+    size_t first = 0;
+    size_t last = 0;
+    SelectedLines(editor, &first, &last);
+    size_t start = 0;
+    size_t end = 0;
+    TextViewGetSelection(editor->view, &start, &end);
+    size_t blockStart = TextViewLineStart(editor->view, first);
+    size_t blockEnd = TextViewLineEnd(editor->view, last);
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    if (text == NULL) {
+        return;
+    }
+    size_t shift = blockEnd - blockStart + 1;
+    ReplaceWithPieces(editor, blockEnd, blockEnd, L"\n", 1, text + blockStart, blockEnd - blockStart, start + shift, end + shift);
+}
+
+static void DeleteLines(Editor *editor)
+{
+    size_t first = 0;
+    size_t last = 0;
+    SelectedLines(editor, &first, &last);
+    size_t from = TextViewLineStart(editor->view, first);
+    size_t to = 0;
+    if (last + 1 < TextViewLineCount(editor->view)) {
+        to = TextViewLineStart(editor->view, last + 1);
+    } else {
+        to = TextViewLineEnd(editor->view, last);
+        from = first > 0 ? TextViewLineEnd(editor->view, first - 1) : from;
+    }
+    TextViewReplaceRange(editor->view, from, to, NULL, 0);
+}
+
+static void MoveLines(Editor *editor, BOOL down)
+{
+    size_t first = 0;
+    size_t last = 0;
+    SelectedLines(editor, &first, &last);
+    if ((!down && first == 0) || (down && last + 1 >= TextViewLineCount(editor->view))) {
+        return;
+    }
+    size_t start = 0;
+    size_t end = 0;
+    TextViewGetSelection(editor->view, &start, &end);
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    if (text == NULL) {
+        return;
+    }
+    size_t blockStart = TextViewLineStart(editor->view, first);
+    size_t blockEnd = TextViewLineEnd(editor->view, last);
+    if (down) {
+        size_t nextStart = blockEnd + 1;
+        size_t nextEnd = TextViewLineEnd(editor->view, last + 1);
+        size_t shift = nextEnd - nextStart + 1;
+        wchar_t *next = MemAlloc((nextEnd - nextStart + 1) * sizeof(wchar_t));
+        if (next != NULL) {
+            memcpy(next, text + nextStart, (nextEnd - nextStart) * sizeof(wchar_t));
+            next[nextEnd - nextStart] = L'\n';
+            ReplaceWithPieces(editor, blockStart, nextEnd, next, nextEnd - nextStart + 1, text + blockStart,
+                blockEnd - blockStart, start + shift, end + shift);
+            MemFree(next);
+        }
+    } else {
+        size_t previousStart = TextViewLineStart(editor->view, first - 1);
+        size_t shift = blockStart - previousStart;
+        wchar_t *block = MemAlloc((blockEnd - blockStart + 1) * sizeof(wchar_t));
+        if (block != NULL) {
+            memcpy(block, text + blockStart, (blockEnd - blockStart) * sizeof(wchar_t));
+            block[blockEnd - blockStart] = L'\n';
+            ReplaceWithPieces(editor, previousStart, blockEnd, block, blockEnd - blockStart + 1, text + previousStart,
+                blockStart - 1 - previousStart, start - shift, end - shift);
+            MemFree(block);
+        }
+    }
+}
+
+static void JoinLines(Editor *editor)
+{
+    size_t first = 0;
+    size_t last = 0;
+    SelectedLines(editor, &first, &last);
+    if (first == last) {
+        if (last + 1 >= TextViewLineCount(editor->view)) {
+            return;
+        }
+        ++last;
+    }
+    size_t from = TextViewLineStart(editor->view, first);
+    size_t to = TextViewLineEnd(editor->view, last);
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    wchar_t *joined = text != NULL ? MemAlloc((to - from + 1) * sizeof(wchar_t)) : NULL;
+    if (joined == NULL) {
+        return;
+    }
+    for (size_t i = from; i < to; ++i) {
+        joined[i - from] = text[i] == L'\n' ? L' ' : text[i];
+    }
+    TextViewReplaceRange(editor->view, from, to, joined, to - from);
+    MemFree(joined);
+}
+
+static void ChangeCase(Editor *editor, BOOL upper)
+{
+    size_t start = 0;
+    size_t end = 0;
+    TextViewGetSelection(editor->view, &start, &end);
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    if (text == NULL || start == end || end - start > 0x7FFFFFFF) {
+        return;
+    }
+    DWORD flags = LCMAP_LINGUISTIC_CASING | (upper ? LCMAP_UPPERCASE : LCMAP_LOWERCASE);
+    int needed = LCMapStringEx(LOCALE_NAME_USER_DEFAULT, flags, text + start, (int)(end - start), NULL, 0, NULL, NULL, 0);
+    wchar_t *mapped = needed > 0 ? MemAlloc((size_t)needed * sizeof(wchar_t)) : NULL;
+    if (mapped == NULL) {
+        return;
+    }
+    int written = LCMapStringEx(LOCALE_NAME_USER_DEFAULT, flags, text + start, (int)(end - start), mapped, needed, NULL, NULL, 0);
+    if (written > 0 && TextViewReplaceRange(editor->view, start, end, mapped, (size_t)written)) {
+        TextViewSetSelection(editor->view, start, start + (size_t)written);
+    }
+    MemFree(mapped);
+}
+
+/* Removes spaces and tabs before every line break and at the end; only the changed span is replaced. */
+static void TrimTrailingWhitespace(Editor *editor)
+{
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    wchar_t *trimmed = text != NULL ? MemAlloc((length + 1) * sizeof(wchar_t)) : NULL;
+    if (trimmed == NULL) {
+        return;
+    }
+    size_t out = 0;
+    size_t keep = 0;
+    for (size_t i = 0; i < length; ++i) {
+        wchar_t ch = text[i];
+        if (ch == L'\n') {
+            out = keep;
+            trimmed[out++] = ch;
+            keep = out;
+        } else {
+            trimmed[out++] = ch;
+            if (ch != L' ' && ch != L'\t') {
+                keep = out;
+            }
+        }
+    }
+    out = keep;
+    if (out != length) {
+        size_t head = 0;
+        while (head < out && text[head] == trimmed[head]) {
+            ++head;
+        }
+        size_t tail = 0;
+        while (tail < out - head && text[length - 1 - tail] == trimmed[out - 1 - tail]) {
+            ++tail;
+        }
+        TextViewReplaceRange(editor->view, head, length - tail, trimmed + head, out - head - tail);
+    }
+    MemFree(trimmed);
+}
+
+static void InsertTimeDate(Editor *editor)
+{
+    wchar_t time[64];
+    wchar_t date[64];
+    if (GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, NULL, NULL, time, ARRAYSIZE(time)) == 0) {
+        time[0] = 0;
+    }
+    if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, NULL, NULL, date, ARRAYSIZE(date), NULL) == 0) {
+        date[0] = 0;
+    }
+    wchar_t *stamp = StringJoin(time, L" ", date);
+    if (stamp != NULL) {
+        size_t start = 0;
+        size_t end = 0;
+        TextViewGetSelection(editor->view, &start, &end);
+        TextViewReplaceRange(editor->view, start, end, stamp, (size_t)lstrlenW(stamp));
+        MemFree(stamp);
+    }
+}
+
+/* ---- File commands ------------------------------------------------------------------------- */
+
+static void ReloadFromDisk(Editor *editor)
+{
+    if (editor->path == NULL) {
+        return;
+    }
+    if (IsDirty(editor) && MessageBoxW(editor->window, L"Discard the changes and load the file again from disk?", QP_APP_NAME,
+            MB_YESNO | MB_ICONWARNING) != IDYES) {
+        return;
+    }
+    size_t caret = TextViewCaretPosition(editor->view);
+    wchar_t *path = StringCopy(editor->path);
+    if (path != NULL && LoadInto(editor, path)) {
+        TextViewSetSelection(editor->view, caret, caret);
+    }
+    MemFree(path);
+}
+
+static void OpenContainingFolder(Editor *editor)
+{
+    wchar_t windows[MAX_PATH];
+    UINT length = GetWindowsDirectoryW(windows, ARRAYSIZE(windows));
+    if (editor->path == NULL || length == 0 || length >= ARRAYSIZE(windows)) {
+        return;
+    }
+    wchar_t *explorer = StringJoin(windows, L"\\explorer.exe", L"");
+    wchar_t *commandLine = StringJoin(L"explorer.exe /select,\"", editor->path, L"\"");
+    STARTUPINFOW startup = { sizeof startup };
+    PROCESS_INFORMATION process;
+    if (explorer != NULL && commandLine != NULL
+        && CreateProcessW(explorer, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+        AllowSetForegroundWindow(process.dwProcessId);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    MemFree(commandLine);
+    MemFree(explorer);
+}
+
+static void CopyPath(Editor *editor)
+{
+    if (editor->path == NULL) {
+        return;
+    }
+    size_t size = ((size_t)lstrlenW(editor->path) + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+    wchar_t *copy = memory != NULL ? GlobalLock(memory) : NULL;
+    if (copy == NULL) {
+        if (memory != NULL) {
+            GlobalFree(memory);
+        }
+        return;
+    }
+    memcpy(copy, editor->path, size);
+    GlobalUnlock(memory);
+    if (OpenClipboard(editor->window)) {
+        EmptyClipboard();
+        if (SetClipboardData(CF_UNICODETEXT, memory) == NULL) {
+            GlobalFree(memory);
+        }
+        CloseClipboard();
+    } else {
+        GlobalFree(memory);
+    }
+}
+
+static void OpenDroppedFiles(Editor *editor, HDROP drop)
+{
+    UINT count = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    for (UINT i = 0; i < count; ++i) {
+        UINT length = DragQueryFileW(drop, i, NULL, 0);
+        wchar_t *path = MemAlloc(((size_t)length + 1) * sizeof(wchar_t));
+        if (path != NULL && DragQueryFileW(drop, i, path, length + 1) != 0 && (GetFileAttributesW(path) & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            OpenFromEditor(editor, path);
+        }
+        MemFree(path);
+    }
+    DragFinish(drop);
+}
+
 static void HandleCommand(Editor *editor, int command)
 {
     HWND view = editor->view;
@@ -795,6 +1414,90 @@ static void HandleCommand(Editor *editor, int command)
     case IDM_START_WITH_WINDOWS:
         StartupToggle(editor->window);
         break;
+    case IDM_FILE_RELOAD:
+        ReloadFromDisk(editor);
+        break;
+    case IDM_FILE_OPEN_FOLDER:
+        OpenContainingFolder(editor);
+        break;
+    case IDM_FILE_COPY_PATH:
+        CopyPath(editor);
+        break;
+    case IDM_EDIT_TIME_DATE:
+        InsertTimeDate(editor);
+        break;
+    case IDM_EDIT_DUPLICATE_LINE:
+        DuplicateLines(editor);
+        break;
+    case IDM_EDIT_DELETE_LINE:
+        DeleteLines(editor);
+        break;
+    case IDM_EDIT_MOVE_LINE_UP:
+        MoveLines(editor, FALSE);
+        break;
+    case IDM_EDIT_MOVE_LINE_DOWN:
+        MoveLines(editor, TRUE);
+        break;
+    case IDM_EDIT_JOIN_LINES:
+        JoinLines(editor);
+        break;
+    case IDM_EDIT_UPPERCASE:
+        ChangeCase(editor, TRUE);
+        break;
+    case IDM_EDIT_LOWERCASE:
+        ChangeCase(editor, FALSE);
+        break;
+    case IDM_EDIT_TRIM_WHITESPACE:
+        TrimTrailingWhitespace(editor);
+        break;
+    case IDM_FORMAT_AUTO_INDENT:
+        ToggleAutoIndent();
+        break;
+    case IDM_FORMAT_FONT:
+        ChooseEditorFont(editor);
+        break;
+    case IDM_FORMAT_TAB_2:
+        SetTabSize(2);
+        break;
+    case IDM_FORMAT_TAB_4:
+        SetTabSize(4);
+        break;
+    case IDM_FORMAT_TAB_8:
+        SetTabSize(8);
+        break;
+    case IDM_FORMAT_CRLF:
+    case IDM_FORMAT_LF:
+    case IDM_FORMAT_CR: {
+        TextFormat format = editor->format;
+        format.lineEnding = (LineEnding)(command - IDM_FORMAT_CRLF);
+        ChangeFormat(editor, format);
+        break;
+    }
+    case IDM_FORMAT_UTF8:
+    case IDM_FORMAT_UTF8_BOM:
+    case IDM_FORMAT_UTF16LE:
+    case IDM_FORMAT_UTF16BE:
+    case IDM_FORMAT_ANSI:
+        ChangeFormat(editor, FormatFromChoice(editor->format, (DWORD)(command - IDM_FORMAT_UTF8)));
+        break;
+    case IDM_VIEW_ZOOM_IN:
+        Zoom(1);
+        break;
+    case IDM_VIEW_ZOOM_OUT:
+        Zoom(-1);
+        break;
+    case IDM_VIEW_ZOOM_RESET:
+        Zoom(0);
+        break;
+    case IDM_VIEW_STATUS_BAR:
+        ToggleStatusBar();
+        break;
+    case IDM_VIEW_ALWAYS_ON_TOP:
+        ToggleTopmost(editor);
+        break;
+    case IDM_VIEW_FULL_SCREEN:
+        ToggleFullScreen(editor);
+        break;
     }
 }
 
@@ -833,20 +1536,38 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         TextViewSetColors(editor->view, ThemeTextColors());
         TextViewSetFont(editor->view, editorFont);
         TextViewSetWordWrap(editor->view, settings.wordWrap);
+        TextViewSetTabSize(editor->view, settings.tabSize);
+        TextViewSetAutoIndent(editor->view, settings.autoIndent);
+        if (settings.statusBar) {
+            ShowStatusBar(editor, TRUE);
+        }
         return 0;
     }
 
     case WM_SIZE:
-        MoveWindow(editor->view, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
+        LayoutEditor(editor);
         return 0;
+
+    case WM_DROPFILES:
+        OpenDroppedFiles(editor, (HDROP)wParam);
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if ((GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0) {
+            Zoom(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1);
+            return 0;
+        }
+        break;
 
     case WM_SETFOCUS:
         SetFocus(editor->view);
         return 0;
 
     case WM_COMMAND:
-        if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == editor->view) {
-            if (TextViewIsModified(editor->view) != editor->modifiedShown) {
+        if (HIWORD(wParam) == TEXTVIEW_SELECTION_CHANGED && (HWND)lParam == editor->view) {
+            UpdateStatus(editor);
+        } else if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == editor->view) {
+            if (IsDirty(editor) != editor->modifiedShown) {
                 UpdateTitle(editor);
             }
         } else {
@@ -854,9 +1575,16 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
 
-    case WM_INITMENUPOPUP:
-        UpdateMenu(editor, (HMENU)wParam);
+    case WM_INITMENUPOPUP: {
+        HMENU popup = (HMENU)wParam;
+        HMENU bar = GetMenu(window);
+        int position = LOWORD(lParam);
+        if (!HIWORD(lParam) && bar != NULL && GetMenuItemCount(popup) == 0 && GetSubMenu(bar, position) == popup) {
+            CopyMenuItems(GetSubMenu(menuTemplate, position), popup);
+        }
+        UpdateMenu(editor, popup);
         return 0;
+    }
 
     case WM_CLOSE:
         /* Only opened windows close; anything asking a pooled window to close is ignored. */
@@ -934,18 +1662,21 @@ static BOOL FontInstalled(HDC dc, const wchar_t *face)
 }
 
 /*
- * Comic Sans MS, or Courier New where it is missing: Courier New has shipped with every Windows
- * version. The stock fixed font covers a system without either.
+ * The font from the settings at the zoomed size. Where it is not installed, Comic Sans MS, then
+ * Courier New, which has shipped with every Windows version; the stock fixed font covers a system
+ * without any of them.
  */
 static HFONT CreateEditorFont(void)
 {
-    static const wchar_t *const faces[] = { L"Comic Sans MS", L"Courier New" };
+    const wchar_t *const faces[] = { settings.fontName, SETTINGS_FONT_NAME_DEFAULT, L"Courier New" };
     HDC screen = GetDC(NULL);
     int dpi = GetDeviceCaps(screen, LOGPIXELSY);
+    int height = -MulDiv(settings.fontSize * settings.zoom, dpi, 72 * 100);
+    height = height < 0 ? height : -1;
     HFONT font = NULL;
     for (size_t i = 0; i < ARRAYSIZE(faces) && font == NULL; ++i) {
         if (FontInstalled(screen, faces[i])) {
-            font = CreateFontW(-MulDiv(11, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faces[i]);
         }
     }
@@ -977,6 +1708,7 @@ BOOL EditorInitialize(HINSTANCE instance)
     }
 
     accelerators = LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDR_ACCELERATORS));
+    menuTemplate = LoadMenuW(instance, MAKEINTRESOURCEW(IDR_MENU));
     findMessage = RegisterWindowMessageW(FINDMSGSTRINGW);
     editorFont = CreateEditorFont();
     WarmGlyphCache();

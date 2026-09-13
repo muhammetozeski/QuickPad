@@ -62,6 +62,7 @@ LAZY_POINTER(L"ole32.dll", void, , CoTaskMemFree, (LPVOID block), (block))
 
 LAZY_POINTER(L"comdlg32.dll", HWND, return, FindTextW, (LPFINDREPLACEW data), (data))
 LAZY_POINTER(L"comdlg32.dll", HWND, return, ReplaceTextW, (LPFINDREPLACEW data), (data))
+LAZY_POINTER(L"comdlg32.dll", BOOL, return, ChooseFontW, (LPCHOOSEFONTW data), (data))
 
 LAZY_POINTER(L"advapi32.dll", LSTATUS, return, RegSetKeyValueW,
     (HKEY key, LPCWSTR subKey, LPCWSTR name, DWORD type, LPCVOID data, DWORD size),
@@ -81,6 +82,9 @@ LAZY_POINTER(L"uxtheme.dll", HRESULT, return, SetWindowTheme,
     (window, application, list))
 
 LAZY_POINTER(L"shell32.dll", BOOL, return, Shell_NotifyIconW, (DWORD message, PNOTIFYICONDATAW data), (message, data))
+LAZY_POINTER(L"shell32.dll", UINT, return, DragQueryFileW, (HDROP drop, UINT index, LPWSTR path, UINT capacity),
+    (drop, index, path, capacity))
+LAZY_POINTER(L"shell32.dll", void, , DragFinish, (HDROP drop), (drop))
 LAZY_POINTER(L"shell32.dll", void, , SHChangeNotify, (LONG eventId, UINT flags, LPCVOID first, LPCVOID second),
     (eventId, flags, first, second))
 
