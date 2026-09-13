@@ -20,6 +20,7 @@ static LARGE_INTEGER frequency;
 static const wchar_t *fileName;
 static HWND shownWindow;
 static double shownAt;
+static double createdAt;
 static BOOL goneAgain;
 
 static double Now(void)
@@ -45,7 +46,12 @@ static void CALLBACK OnEvent(HWINEVENTHOOK hook, DWORD event, HWND window, LONG 
         return;
     }
 
-    if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED) {
+    if (event == EVENT_OBJECT_CREATE) {
+        wchar_t className[64];
+        if (createdAt == 0 && GetClassNameW(window, className, 64) > 0 && wcscmp(className, EDITOR_CLASS) == 0) {
+            createdAt = at;
+        }
+    } else if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED) {
         wchar_t title[512];
         InternalGetWindowText(window, title, 512);
         if (shownWindow == NULL && wcsstr(title, fileName) != NULL && IsWindowVisible(window) && !IsCloaked(window)) {
@@ -129,7 +135,7 @@ int wmain(int argc, wchar_t **argv)
         wprintf(L"pool: %d editor windows after %lu ms\n", CountEditors(), GetTickCount() - start);
     }
 
-    HWINEVENTHOOK showHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    HWINEVENTHOOK showHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
     HWINEVENTHOOK cloakHook = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, NULL, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     double total = 0;
@@ -137,6 +143,7 @@ int wmain(int argc, wchar_t **argv)
     for (int run = 0; run < runs; ++run) {
         shownWindow = NULL;
         goneAgain = FALSE;
+        createdAt = 0;
 
         size_t commandLength = wcslen(executable) + wcslen(file) + 8;
         wchar_t *commandLine = malloc(commandLength * sizeof(wchar_t));
@@ -163,10 +170,14 @@ int wmain(int argc, wchar_t **argv)
             wprintf(L"run %d: no window within 10 s\n", run + 1);
         } else {
             double elapsed = shownAt - started;
+            wchar_t created[48] = L"no window created";
+            if (createdAt != 0) {
+                swprintf(created, 48, L"window created at %.2f ms", createdAt - started);
+            }
             if (launcherExit >= 0) {
-                wprintf(L"run %d: visible after %.2f ms (launcher process lived %.1f ms)\n", run + 1, elapsed, launcherExit);
+                wprintf(L"run %d: visible after %.2f ms (%s, launcher process lived %.1f ms)\n", run + 1, elapsed, created, launcherExit);
             } else {
-                wprintf(L"run %d: visible after %.2f ms (launcher still running)\n", run + 1, elapsed);
+                wprintf(L"run %d: visible after %.2f ms (%s, launcher still running)\n", run + 1, elapsed, created);
             }
             total += elapsed;
             ++measured;
