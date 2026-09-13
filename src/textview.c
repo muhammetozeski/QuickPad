@@ -30,6 +30,7 @@ typedef struct TextView {
     BOOL caretTrailing;      /* caret on a wrap boundary is drawn at the end of the upper row */
     long long desiredX;      /* x kept across vertical moves, -1 when not set */
     HFONT font;
+    const TextViewColors *palette;
     int lineHeight;
     int charWidth;
     int margin;
@@ -868,6 +869,13 @@ static COLORREF Blend(COLORREF front, COLORREF back, int weight)
 static Colors CurrentColors(const TextView *view)
 {
     Colors colors;
+    if (view->palette != NULL) {
+        colors.text = view->palette->text;
+        colors.background = view->palette->background;
+        colors.selectedText = view->focused ? view->palette->selectedText : view->palette->text;
+        colors.selectedBackground = view->focused ? view->palette->selectedBackground : view->palette->unfocusedSelectedBackground;
+        return colors;
+    }
     colors.text = GetSysColor(COLOR_WINDOWTEXT);
     colors.background = GetSysColor(COLOR_WINDOW);
     if (view->focused) {
@@ -1531,6 +1539,12 @@ void TextViewMarkSaved(HWND window)
 void TextViewSetFont(HWND window, HFONT font)
 {
     ApplyFont(ViewFrom(window), font);
+}
+
+void TextViewSetColors(HWND window, const TextViewColors *colors)
+{
+    ViewFrom(window)->palette = colors;
+    InvalidateRect(window, NULL, FALSE);
 }
 
 void TextViewSetWordWrap(HWND window, BOOL wrap)

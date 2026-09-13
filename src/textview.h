@@ -11,8 +11,19 @@
  */
 #define TEXTVIEW_CLASS L"QuickPadTextView"
 
+typedef struct TextViewColors {
+    COLORREF text;
+    COLORREF background;
+    COLORREF selectedText;
+    COLORREF selectedBackground;
+    COLORREF unfocusedSelectedBackground;
+} TextViewColors;
+
 BOOL TextViewRegisterClass(HINSTANCE instance);
 HWND TextViewCreate(HWND parent, int id, HINSTANCE instance);
+
+/* colors must stay valid while the view uses them; NULL returns to the system colors. */
+void TextViewSetColors(HWND view, const TextViewColors *colors);
 
 /* Takes over text, a MemAlloc block; clears undo and puts the caret at the start. */
 BOOL TextViewSetText(HWND view, wchar_t *text, size_t length);

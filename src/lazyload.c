@@ -10,9 +10,11 @@
  */
 #include "quickpad.h"
 
+#include <dwmapi.h>
 #include <imm.h>
 #include <objbase.h>
 #include <shobjidl.h>
+#include <uxtheme.h>
 
 static FARPROC Bind(const wchar_t *library, const char *function)
 {
@@ -54,6 +56,14 @@ LAZY_POINTER(L"ole32.dll", HRESULT, return, CoCreateInstance,
     (REFCLSID classId, LPUNKNOWN outer, DWORD context, REFIID interfaceId, LPVOID *object),
     (classId, outer, context, interfaceId, object))
 LAZY_POINTER(L"ole32.dll", void, , CoTaskMemFree, (LPVOID block), (block))
+
+LAZY_POINTER(L"dwmapi.dll", HRESULT, return, DwmSetWindowAttribute,
+    (HWND window, DWORD attribute, LPCVOID data, DWORD size),
+    (window, attribute, data, size))
+
+LAZY_POINTER(L"uxtheme.dll", HRESULT, return, SetWindowTheme,
+    (HWND window, LPCWSTR application, LPCWSTR list),
+    (window, application, list))
 
 LAZY_POINTER(L"shell32.dll", HRESULT, return, SHCreateItemFromParsingName,
     (PCWSTR path, IBindCtx *context, REFIID interfaceId, void **item),

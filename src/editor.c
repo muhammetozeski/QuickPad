@@ -5,6 +5,7 @@
 #include "quickpad.h"
 #include "resource.h"
 #include "textview.h"
+#include "theme.h"
 
 #include <shobjidl.h>
 
@@ -492,12 +493,20 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         return DefWindowProcW(window, message, wParam, lParam);
     }
 
+    LRESULT themed = 0;
+    if (ThemeMenuBarMessage(window, message, wParam, lParam, &themed)) {
+        return themed;
+    }
+
     switch (message) {
     case WM_CREATE:
+        ThemePrepareWindow(window);
         editor->view = TextViewCreate(window, VIEW_ID, instanceHandle);
         if (editor->view == NULL) {
             return -1;
         }
+        ThemePrepareScrollBars(editor->view);
+        TextViewSetColors(editor->view, ThemeTextColors());
         TextViewSetFont(editor->view, editorFont);
         return 0;
 
@@ -561,6 +570,7 @@ BOOL EditorInitialize(HINSTANCE instance)
     if (!TextViewRegisterClass(instance)) {
         return FALSE;
     }
+    ThemeInitialize();
 
     WNDCLASSEXW windowClass = { sizeof windowClass };
     windowClass.lpfnWndProc = EditorProc;
