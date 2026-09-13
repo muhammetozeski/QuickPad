@@ -18,3 +18,6 @@
 #define IDM_EDIT_SELECT_ALL      40021
 
 #define IDM_FORMAT_WORD_WRAP     40030
+
+#define IDM_TRAY_NEW             40100
+#define IDM_TRAY_EXIT            40101

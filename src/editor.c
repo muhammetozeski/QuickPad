@@ -47,6 +47,7 @@ static HACCEL accelerators;
 static HFONT editorFont;
 static Editor *editors;
 static BOOL comReady;
+static BOOL residentProcess;
 
 /* ---- Small helpers ------------------------------------------------------------------------- */
 
@@ -568,7 +569,7 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         BOOL wasShown = editor->shown;
         MemFree(editor->path);
         MemFree(editor);
-        if (editors == NULL && wasShown) {
+        if (!residentProcess && wasShown && EditorShownCount() == 0) {
             PostQuitMessage(0);
         }
         return 0;
@@ -635,6 +636,35 @@ BOOL EditorOpenNew(void)
         return FALSE;
     }
     ShowEditor(editor);
+    return TRUE;
+}
+
+void EditorSetResident(BOOL resident)
+{
+    residentProcess = resident;
+}
+
+int EditorShownCount(void)
+{
+    int count = 0;
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        count += editor->shown;
+    }
+    return count;
+}
+
+BOOL EditorCloseAll(void)
+{
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        if (editor->shown && !ConfirmDiscard(editor)) {
+            return FALSE;
+        }
+    }
+    while (editors != NULL) {
+        HWND window = editors->window;
+        editors->shown = FALSE;
+        DestroyWindow(window);
+    }
     return TRUE;
 }
 

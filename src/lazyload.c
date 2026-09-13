@@ -13,6 +13,7 @@
 #include <dwmapi.h>
 #include <imm.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
 
@@ -64,6 +65,8 @@ LAZY_POINTER(L"dwmapi.dll", HRESULT, return, DwmSetWindowAttribute,
 LAZY_POINTER(L"uxtheme.dll", HRESULT, return, SetWindowTheme,
     (HWND window, LPCWSTR application, LPCWSTR list),
     (window, application, list))
+
+LAZY_POINTER(L"shell32.dll", BOOL, return, Shell_NotifyIconW, (DWORD message, PNOTIFYICONDATAW data), (message, data))
 
 LAZY_POINTER(L"shell32.dll", HRESULT, return, SHCreateItemFromParsingName,
     (PCWSTR path, IBindCtx *context, REFIID interfaceId, void **item),
