@@ -1,8 +1,9 @@
 /*
  * Development tool: sends a menu command to a window found by its exact title and waits until the
- * window has handled it. With "close" as the third argument the window is sent WM_CLOSE afterwards.
+ * window has handled it. With "close" as the third argument the window is sent WM_CLOSE afterwards;
+ * with "post" the command is posted without waiting, for commands that open a modal dialog.
  *
- *     command "notes.txt - QuickPad" 40003 [close]
+ *     command "notes.txt - QuickPad" 40003 [close | post]
  */
 #include <windows.h>
 #include <stdio.h>
@@ -30,6 +31,9 @@ int wmain(int argc, wchar_t **argv)
 
     DWORD_PTR result = 0;
     WPARAM command = (WPARAM)wcstoul(argv[2], NULL, 10);
+    if (argc > 3 && wcscmp(argv[3], L"post") == 0) {
+        return PostMessageW(window, WM_COMMAND, command, 0) ? 0 : 1;
+    }
     if (!SendMessageTimeoutW(window, WM_COMMAND, command, 0, SMTO_ABORTIFHUNG, 30000, &result)) {
         fwprintf(stderr, L"the window did not handle the command\n");
         return 1;
