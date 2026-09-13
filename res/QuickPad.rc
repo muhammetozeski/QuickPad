@@ -9,6 +9,8 @@ BEGIN
     BEGIN
         MENUITEM "&New\tCtrl+N",            IDM_FILE_NEW
         MENUITEM "&Open...\tCtrl+O",        IDM_FILE_OPEN
+        MENUITEM "&Save\tCtrl+S",           IDM_FILE_SAVE
+        MENUITEM "Save &As...\tCtrl+Shift+S", IDM_FILE_SAVE_AS
         MENUITEM SEPARATOR
         MENUITEM "&Close\tCtrl+W",          IDM_FILE_CLOSE
     END
@@ -30,5 +32,7 @@ IDR_ACCELERATORS ACCELERATORS
 BEGIN
     "N",    IDM_FILE_NEW,       VIRTKEY, CONTROL
     "O",    IDM_FILE_OPEN,      VIRTKEY, CONTROL
+    "S",    IDM_FILE_SAVE,      VIRTKEY, CONTROL
+    "S",    IDM_FILE_SAVE_AS,   VIRTKEY, CONTROL, SHIFT
     "W",    IDM_FILE_CLOSE,     VIRTKEY, CONTROL
 END

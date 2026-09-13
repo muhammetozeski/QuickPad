@@ -89,3 +89,75 @@ BOOL FileLoad(const wchar_t *path, wchar_t **text, size_t *length, TextFormat *f
     CloseHandle(file);
     return *text != NULL;
 }
+
+static BOOL WriteAll(HANDLE file, const unsigned char *data, size_t size, DWORD *error)
+{
+    size_t done = 0;
+    while (done < size) {
+        DWORD chunk = size - done > READ_CHUNK ? READ_CHUNK : (DWORD)(size - done);
+        DWORD written = 0;
+        if (!WriteFile(file, data + done, chunk, &written, NULL)) {
+            *error = GetLastError();
+            return FALSE;
+        }
+        done += written;
+    }
+    return TRUE;
+}
+
+static BOOL WriteInPlace(const wchar_t *path, const unsigned char *data, size_t size, DWORD *error)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        *error = GetLastError();
+        return FALSE;
+    }
+    BOOL written = WriteAll(file, data, size, error);
+    if (written && !SetEndOfFile(file)) {
+        *error = GetLastError();
+        written = FALSE;
+    }
+    CloseHandle(file);
+    return written;
+}
+
+BOOL FileWrite(const wchar_t *path, const unsigned char *data, size_t size, DWORD *error)
+{
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return WriteInPlace(path, data, size, error);
+    }
+
+    static const wchar_t suffix[] = L".QuickPad-save.tmp";
+    size_t pathLength = (size_t)lstrlenW(path);
+    wchar_t *temporary = MemAlloc((pathLength + ARRAYSIZE(suffix)) * sizeof(wchar_t));
+    if (temporary == NULL) {
+        *error = ERROR_NOT_ENOUGH_MEMORY;
+        return FALSE;
+    }
+    memcpy(temporary, path, pathLength * sizeof(wchar_t));
+    memcpy(temporary + pathLength, suffix, sizeof suffix);
+
+    HANDLE file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        MemFree(temporary);
+        return WriteInPlace(path, data, size, error);
+    }
+    BOOL written = WriteAll(file, data, size, error);
+    CloseHandle(file);
+    if (!written) {
+        DeleteFileW(temporary);
+        MemFree(temporary);
+        return FALSE;
+    }
+
+    BOOL swapped = attributes == INVALID_FILE_ATTRIBUTES
+        ? MoveFileExW(temporary, path, MOVEFILE_WRITE_THROUGH)
+        : ReplaceFileW(path, temporary, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, NULL, NULL);
+    if (!swapped) {
+        DeleteFileW(temporary);
+        swapped = WriteInPlace(path, data, size, error);
+    }
+    MemFree(temporary);
+    return swapped;
+}

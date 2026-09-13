@@ -12,6 +12,7 @@
 
 #include <imm.h>
 #include <objbase.h>
+#include <shobjidl.h>
 
 static FARPROC Bind(const wchar_t *library, const char *function)
 {
@@ -53,3 +54,7 @@ LAZY_POINTER(L"ole32.dll", HRESULT, return, CoCreateInstance,
     (REFCLSID classId, LPUNKNOWN outer, DWORD context, REFIID interfaceId, LPVOID *object),
     (classId, outer, context, interfaceId, object))
 LAZY_POINTER(L"ole32.dll", void, , CoTaskMemFree, (LPVOID block), (block))
+
+LAZY_POINTER(L"shell32.dll", HRESULT, return, SHCreateItemFromParsingName,
+    (PCWSTR path, IBindCtx *context, REFIID interfaceId, void **item),
+    (path, context, interfaceId, item))

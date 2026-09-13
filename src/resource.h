@@ -5,6 +5,8 @@
 
 #define IDM_FILE_NEW             40001
 #define IDM_FILE_OPEN            40002
+#define IDM_FILE_SAVE            40003
+#define IDM_FILE_SAVE_AS         40004
 #define IDM_FILE_CLOSE           40005
 
 #define IDM_EDIT_UNDO            40010

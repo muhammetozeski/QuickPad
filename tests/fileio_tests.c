@@ -86,6 +86,26 @@ int wmain(void)
     DeleteFileW(path);
     MemFree(large);
 
+    PathIn(path, L"written.txt");
+    const unsigned char first[] = { 'o', 'n', 'e' };
+    const unsigned char second[] = { 't', 'w', 'o', '!', '\r', '\n' };
+    CHECK(FileWrite(path, first, sizeof first, &error), "write a new file");
+    CHECK(FileLoad(path, &text, &length, &format, &error) && length == 3 && wmemcmp(text, L"one", 3) == 0, "new file content");
+    MemFree(text);
+    SetFileAttributesW(path, FILE_ATTRIBUTE_HIDDEN);
+    CHECK(FileWrite(path, second, sizeof second, &error), "replace an existing hidden file");
+    CHECK(FileLoad(path, &text, &length, &format, &error) && length == 6 && wmemcmp(text, L"two!\r\n", 6) == 0, "replaced content");
+    MemFree(text);
+    CHECK((GetFileAttributesW(path) & FILE_ATTRIBUTE_HIDDEN) != 0, "replacing keeps the hidden attribute");
+    wchar_t leftover[MAX_PATH];
+    PathIn(leftover, L"written.txt.QuickPad-save.tmp");
+    CHECK(GetFileAttributesW(leftover) == INVALID_FILE_ATTRIBUTES, "no temporary file is left behind");
+    SetFileAttributesW(path, FILE_ATTRIBUTE_READONLY);
+    CHECK(!FileWrite(path, first, sizeof first, &error) && error == ERROR_ACCESS_DENIED, "read-only file is refused");
+    CHECK(GetFileAttributesW(leftover) == INVALID_FILE_ATTRIBUTES, "no temporary file after a refusal");
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(path);
+
     RemoveDirectoryW(folder);
     wprintf(L"%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

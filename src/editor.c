@@ -10,6 +10,24 @@
 
 #define EDITOR_CLASS L"QuickPadEditor"
 #define VIEW_ID 1
+#define ENCODING_GROUP 100
+#define ENCODING_COMBO 101
+
+enum EncodingChoice {
+    CHOICE_UTF8,
+    CHOICE_UTF8_WITH_MARK,
+    CHOICE_UTF16LE,
+    CHOICE_UTF16BE,
+    CHOICE_ANSI,
+};
+
+static const wchar_t *const encodingNames[] = {
+    L"UTF-8",
+    L"UTF-8 with BOM",
+    L"UTF-16 LE",
+    L"UTF-16 BE",
+    L"ANSI",
+};
 
 typedef struct Editor {
     struct Editor *next;
@@ -241,6 +259,170 @@ static void ShowOpenDialog(Editor *editor)
     IFileOpenDialog_Release(dialog);
 }
 
+static DWORD ChoiceFromFormat(TextFormat format)
+{
+    switch (format.encoding) {
+    case TEXT_ENCODING_UTF16LE:
+        return CHOICE_UTF16LE;
+    case TEXT_ENCODING_UTF16BE:
+        return CHOICE_UTF16BE;
+    case TEXT_ENCODING_ANSI:
+        return CHOICE_ANSI;
+    default:
+        return format.byteOrderMark ? CHOICE_UTF8_WITH_MARK : CHOICE_UTF8;
+    }
+}
+
+/* Applies the encoding picked in Save As; picking the current encoding keeps the file's own byte order mark state. */
+static TextFormat FormatFromChoice(TextFormat format, DWORD choice)
+{
+    if (choice == ChoiceFromFormat(format)) {
+        return format;
+    }
+    format.byteOrderMark = choice != CHOICE_UTF8 && choice != CHOICE_ANSI;
+    format.encoding = choice == CHOICE_UTF16LE ? TEXT_ENCODING_UTF16LE
+        : choice == CHOICE_UTF16BE ? TEXT_ENCODING_UTF16BE
+        : choice == CHOICE_ANSI ? TEXT_ENCODING_ANSI
+        : TEXT_ENCODING_UTF8;
+    return format;
+}
+
+static BOOL SaveTo(Editor *editor, const wchar_t *path, TextFormat format)
+{
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(editor->view, &length);
+    size_t size = 0;
+    BOOL lossy = FALSE;
+    unsigned char *bytes = text != NULL ? TextEncode(text, length, format, &size, &lossy) : NULL;
+    if (bytes != NULL && lossy) {
+        int answer = MessageBoxW(editor->window,
+            L"This document contains characters the ANSI encoding cannot store. They would be saved as question marks.\n\n"
+            L"Do you want to save it as UTF-8 instead?",
+            QP_APP_NAME, MB_YESNOCANCEL | MB_ICONWARNING);
+        if (answer == IDCANCEL) {
+            MemFree(bytes);
+            return FALSE;
+        }
+        if (answer == IDYES) {
+            MemFree(bytes);
+            format.encoding = TEXT_ENCODING_UTF8;
+            format.byteOrderMark = FALSE;
+            bytes = TextEncode(text, length, format, &size, &lossy);
+        }
+    }
+    if (bytes == NULL) {
+        ShowFileError(editor, path, ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    DWORD error = 0;
+    BOOL written = FileWrite(path, bytes, size, &error);
+    MemFree(bytes);
+    if (!written) {
+        ShowFileError(editor, path, error);
+        return FALSE;
+    }
+
+    if (editor->path == NULL || CompareStringOrdinal(editor->path, -1, path, -1, FALSE) != CSTR_EQUAL) {
+        SetPath(editor, path);
+    }
+    editor->format = format;
+    TextViewMarkSaved(editor->view);
+    UpdateTitle(editor);
+    return TRUE;
+}
+
+static BOOL SaveAs(Editor *editor)
+{
+    IFileSaveDialog *dialog = NULL;
+    if (!EnsureCom() || FAILED(CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IFileSaveDialog, (void **)&dialog))) {
+        return FALSE;
+    }
+
+    COMDLG_FILTERSPEC filters[] = {
+        { L"Text Documents (*.txt)", L"*.txt" },
+        { L"All Files (*.*)", L"*.*" },
+    };
+    IFileSaveDialog_SetFileTypes(dialog, ARRAYSIZE(filters), filters);
+    IFileSaveDialog_SetDefaultExtension(dialog, L"txt");
+    FILEOPENDIALOGOPTIONS options = 0;
+    IFileSaveDialog_GetOptions(dialog, &options);
+    IFileSaveDialog_SetOptions(dialog, options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOREADONLYRETURN);
+
+    if (editor->path != NULL) {
+        wchar_t *folder = CopyString(editor->path);
+        if (folder != NULL) {
+            wchar_t *name = (wchar_t *)FileName(folder);
+            if (name > folder) {
+                name[-1] = 0;
+                IShellItem *folderItem = NULL;
+                if (SUCCEEDED(SHCreateItemFromParsingName(folder, NULL, &IID_IShellItem, (void **)&folderItem))) {
+                    IFileSaveDialog_SetFolder(dialog, folderItem);
+                    IShellItem_Release(folderItem);
+                }
+            }
+            MemFree(folder);
+        }
+        IFileSaveDialog_SetFileName(dialog, FileName(editor->path));
+    } else {
+        IFileSaveDialog_SetFileName(dialog, L"Untitled.txt");
+    }
+
+    IFileDialogCustomize *customize = NULL;
+    if (SUCCEEDED(IFileSaveDialog_QueryInterface(dialog, &IID_IFileDialogCustomize, (void **)&customize))) {
+        IFileDialogCustomize_StartVisualGroup(customize, ENCODING_GROUP, L"&Encoding:");
+        IFileDialogCustomize_AddComboBox(customize, ENCODING_COMBO);
+        for (DWORD i = 0; i < ARRAYSIZE(encodingNames); ++i) {
+            IFileDialogCustomize_AddControlItem(customize, ENCODING_COMBO, i, encodingNames[i]);
+        }
+        IFileDialogCustomize_SetSelectedControlItem(customize, ENCODING_COMBO, ChoiceFromFormat(editor->format));
+        IFileDialogCustomize_EndVisualGroup(customize);
+    }
+
+    BOOL saved = FALSE;
+    IShellItem *item = NULL;
+    if (SUCCEEDED(IFileSaveDialog_Show(dialog, editor->window)) && SUCCEEDED(IFileSaveDialog_GetResult(dialog, &item))) {
+        wchar_t *path = NULL;
+        if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path))) {
+            DWORD choice = ChoiceFromFormat(editor->format);
+            if (customize != NULL) {
+                IFileDialogCustomize_GetSelectedControlItem(customize, ENCODING_COMBO, &choice);
+            }
+            saved = SaveTo(editor, path, FormatFromChoice(editor->format, choice));
+            CoTaskMemFree(path);
+        }
+        IShellItem_Release(item);
+    }
+    if (customize != NULL) {
+        IFileDialogCustomize_Release(customize);
+    }
+    IFileSaveDialog_Release(dialog);
+    return saved;
+}
+
+static BOOL Save(Editor *editor)
+{
+    return editor->path != NULL ? SaveTo(editor, editor->path, editor->format) : SaveAs(editor);
+}
+
+/* Offers to save unsaved changes; FALSE when the user cancels. */
+static BOOL ConfirmDiscard(Editor *editor)
+{
+    if (!TextViewIsModified(editor->view)) {
+        return TRUE;
+    }
+    SetForegroundWindow(editor->window);
+    wchar_t *question = Concat(L"Do you want to save changes to ", editor->path != NULL ? editor->path : L"Untitled", L"?");
+    int answer = MessageBoxW(editor->window, question != NULL ? question : L"Do you want to save changes?", QP_APP_NAME,
+        MB_YESNOCANCEL | MB_ICONWARNING);
+    MemFree(question);
+    if (answer == IDYES) {
+        return Save(editor);
+    }
+    return answer == IDNO;
+}
+
 static void UpdateMenu(Editor *editor, HMENU menu)
 {
     size_t start = 0;
@@ -264,6 +446,12 @@ static void HandleCommand(Editor *editor, int command)
         break;
     case IDM_FILE_OPEN:
         ShowOpenDialog(editor);
+        break;
+    case IDM_FILE_SAVE:
+        Save(editor);
+        break;
+    case IDM_FILE_SAVE_AS:
+        SaveAs(editor);
         break;
     case IDM_FILE_CLOSE:
         SendMessageW(editor->window, WM_CLOSE, 0, 0);
@@ -336,8 +524,13 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
 
     case WM_CLOSE:
-        CloseEditor(editor);
+        if (ConfirmDiscard(editor)) {
+            CloseEditor(editor);
+        }
         return 0;
+
+    case WM_QUERYENDSESSION:
+        return ConfirmDiscard(editor);
 
     case WM_NCDESTROY: {
         Editor **link = &editors;
