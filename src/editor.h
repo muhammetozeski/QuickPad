@@ -5,8 +5,11 @@
 /* Registers the window classes and loads what every editor window shares. */
 BOOL EditorInitialize(HINSTANCE instance);
 
-/* A resident process keeps running when its last editor window closes; otherwise it quits. */
-void EditorSetResident(BOOL resident);
+/*
+ * With a host window the process is resident: it keeps running when its last editor window closes,
+ * and pooled windows are owned by the host. Without one the process quits with its last window.
+ */
+void EditorSetHost(HWND host);
 
 /* Opens a full path in its own window, or brings forward the window that already shows it. */
 BOOL EditorOpenFile(const wchar_t *path);

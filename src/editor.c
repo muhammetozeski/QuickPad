@@ -54,6 +54,7 @@ static HFONT editorFont;
 static Editor *editors;
 static BOOL comReady;
 static BOOL residentProcess;
+static HWND ownerWindow;
 
 /* ---- Small helpers ------------------------------------------------------------------------- */
 
@@ -118,7 +119,11 @@ static void SetCloaked(HWND window, BOOL cloaked)
     DwmSetWindowAttribute(window, DWMWA_CLOAK, &cloaked, sizeof cloaked);
 }
 
-/* The taskbar lists cloaked windows too, so pooled windows have their buttons removed through this. */
+/*
+ * Windows gives visible top-level windows a taskbar button even when they are cloaked, unless they
+ * have an owner. Pooled windows are owned by the host window; a window that opens loses its owner and
+ * gets its button through this.
+ */
 static ITaskbarList *Taskbar(void)
 {
     static ITaskbarList *taskbar;
@@ -200,8 +205,8 @@ static void ParkEditor(Editor *editor)
     placement.flags = 0;
     placement.showCmd = SW_SHOWNOACTIVATE;
     SetRect(&placement.rcNormalPosition, PARK_POSITION, PARK_POSITION, PARK_POSITION + size.cx, PARK_POSITION + size.cy);
+    SetWindowLongPtrW(editor->window, GWLP_HWNDPARENT, (LONG_PTR)ownerWindow);
     SetWindowPlacement(editor->window, &placement);
-    SetTaskbarButton(editor->window, FALSE);
     RedrawWindow(editor->window, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN);
     editor->pooled = TRUE;
 }
@@ -218,7 +223,7 @@ static Editor *CreateEditor(void)
     SIZE size = WindowSize(&work);
     HMENU menu = LoadMenuW(instanceHandle, MAKEINTRESOURCEW(IDR_MENU));
     HWND window = CreateWindowExW(0, EDITOR_CLASS, L"Untitled - " QP_APP_NAME, WS_OVERLAPPEDWINDOW,
-        PARK_POSITION, PARK_POSITION, size.cx, size.cy, NULL, menu, instanceHandle, editor);
+        PARK_POSITION, PARK_POSITION, size.cx, size.cy, ownerWindow, menu, instanceHandle, editor);
     if (window == NULL) {
         if (menu != NULL) {
             DestroyMenu(menu);
@@ -259,6 +264,7 @@ static void ShowEditor(Editor *editor)
     RECT frame = NewWindowFrame();
     editor->pooled = FALSE;
     editor->shown = TRUE;
+    SetWindowLongPtrW(window, GWLP_HWNDPARENT, 0);
     SetWindowPos(window, HWND_TOP, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, SWP_NOACTIVATE);
     RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
     SetCloaked(window, FALSE);
@@ -288,6 +294,7 @@ static void CloseEditor(Editor *editor)
     }
 
     SetCloaked(window, TRUE);
+    SetTaskbarButton(window, FALSE);
     ShowWindow(window, SW_HIDE);
     TextViewClear(editor->view);
     SetPath(editor, NULL);
@@ -670,7 +677,8 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
 
     case WM_CLOSE:
-        if (ConfirmDiscard(editor)) {
+        /* Only opened windows close; anything asking a pooled window to close is ignored. */
+        if (editor->shown && ConfirmDiscard(editor)) {
             CloseEditor(editor);
         }
         return 0;
@@ -814,9 +822,10 @@ void EditorSetPoolSize(int size)
     SettingsSave();
 }
 
-void EditorSetResident(BOOL resident)
+void EditorSetHost(HWND host)
 {
-    residentProcess = resident;
+    residentProcess = host != NULL;
+    ownerWindow = host;
 }
 
 int EditorShownCount(void)

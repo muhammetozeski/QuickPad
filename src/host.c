@@ -227,7 +227,7 @@ int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, 
     } else {
         resident = FALSE;
     }
-    EditorSetResident(resident);
+    EditorSetHost(resident ? hostWindow : NULL);
 
     for (size_t i = 0; i < count; ++i) {
         EditorOpenFile(paths[i]);
