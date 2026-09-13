@@ -279,6 +279,56 @@ static void TestPaint(void)
     DeleteDC(dc);
 }
 
+static int selectionNotifications;
+
+static LRESULT CALLBACK ParentProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_COMMAND && HIWORD(wParam) == TEXTVIEW_SELECTION_CHANGED) {
+        ++selectionNotifications;
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+static void TestEditorOperations(void)
+{
+    Load(L"one\ntwo\nthree");
+    CHECK(TextViewLineStart(view, 1) == 4 && TextViewLineEnd(view, 1) == 7, "line start and end");
+    CHECK(TextViewLineFromPosition(view, 9) == 2, "line from position");
+    CHECK(TextViewReplaceRange(view, 4, 7, L"TWO", 3) && TextIs(L"one\nTWO\nthree") && TextViewCaretPosition(view) == 7,
+        "replace range puts the caret after the text");
+    TextViewUndo(view);
+    CHECK(TextIs(L"one\ntwo\nthree"), "replace range is one undo step");
+    CHECK(TextViewReplaceRange(view, 100, 200, L"!", 1) && TextIs(L"one\ntwo\nthree!"), "replace range past the end appends");
+
+    Load(L"\tx");
+    int pastX = margin + 5 * charWidth + charWidth / 2 + 1;
+    Click(pastX, 1, FALSE);
+    CHECK(SelectionIs(1, 1), "with tab size eight the point is before x");
+    TextViewSetTabSize(view, 4);
+    Click(pastX, 1, FALSE);
+    CHECK(SelectionIs(2, 2), "with tab size four the point is after x");
+    TextViewSetTabSize(view, 8);
+
+    Load(L"  \tindented");
+    TextViewSetAutoIndent(view, TRUE);
+    Key(VK_END, FALSE, FALSE);
+    Type(L"\r");
+    CHECK(TextIs(L"  \tindented\n  \t"), "auto indent repeats the leading blanks");
+    TextViewSetAutoIndent(view, FALSE);
+    Type(L"\r");
+    CHECK(TextIs(L"  \tindented\n  \t\n"), "without auto indent enter adds only a line break");
+
+    selectionNotifications = 0;
+    Key(VK_LEFT, FALSE, FALSE);
+    CHECK(selectionNotifications == 0, "no selection notifications unless asked");
+    TextViewNotifySelection(view, TRUE);
+    Key(VK_LEFT, FALSE, FALSE);
+    Type(L"a");
+    CHECK(selectionNotifications == 2, "caret moves and edits notify when asked");
+    TextViewNotifySelection(view, FALSE);
+}
+
 static void TestLargeText(void)
 {
     size_t lines = 200000;
@@ -320,7 +370,7 @@ int wmain(void)
     TextViewRegisterClass(instance);
 
     WNDCLASSW parentClass = { 0 };
-    parentClass.lpfnWndProc = DefWindowProcW;
+    parentClass.lpfnWndProc = ParentProc;
     parentClass.hInstance = instance;
     parentClass.lpszClassName = L"TextViewTestParent";
     RegisterClassW(&parentClass);
@@ -350,6 +400,7 @@ int wmain(void)
     TestMouse();
     TestWordWrap();
     TestPaint();
+    TestEditorOperations();
     TestLargeText();
 
     DestroyWindow(parent);
