@@ -1872,9 +1872,8 @@ BOOL EditorIdle(DWORD *wait)
             SetWindowPos(next->window, HWND_TOPMOST, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
                 SWP_NOACTIVATE | (moves ? 0 : SWP_NOMOVE | SWP_NOSIZE));
             next->raised = TRUE;
-            if (moves) {
-                RedrawWindow(next->window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
-            }
+            /* The first drawing after a window moved or changed place in the z-order is slow; it happens here, not when a file opens. */
+            RedrawWindow(next->window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
             return TRUE;
         }
     }
