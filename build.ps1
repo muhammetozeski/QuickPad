@@ -137,7 +137,7 @@ if ($Test) {
         'layout_tests'   = @('layout.c')
         'history_tests'  = @('history.c', 'document.c') + $loading
         'search_tests'   = @('search.c')
-        'textview_tests' = @('textview.c', 'document.c', 'history.c', 'layout.c', 'search.c') + $loading
+        'textview_tests' = @('textview.c', 'glyphs.c', 'document.c', 'history.c', 'layout.c', 'search.c') + $loading
         'fileio_tests'   = @('fileio.c') + $loading
     }
     foreach ($name in $unitTests.Keys) {

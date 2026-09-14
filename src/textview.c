@@ -1,10 +1,13 @@
 #include "textview.h"
 #include "document.h"
+#include "glyphs.h"
 #include "history.h"
 #include "layout.h"
 #include "quickpad.h"
 #include "trace.h"
+#include "workers.h"
 
+#include <emmintrin.h>
 #include <imm.h>
 #include <limits.h>
 #include <windowsx.h>
@@ -16,15 +19,29 @@
 /* A painted row longer than this beyond the window has the rest of its width estimated from its length. */
 #define MEASURED_REMAINDER 4096
 
-/* Character widths of one font, shared by every view that uses it. */
+#define ATLAS_COLORS 4
+
+/* Character widths and glyph bitmaps of one font, shared by every view that uses it. */
 typedef struct FontMetrics {
     struct FontMetrics *next;
     HFONT font;
     int users;
+    int lineHeight;
     LayoutMetrics layout;
+    GlyphAtlas *atlases[ATLAS_COLORS];   /* one per pair of text and background colors, made when first painted with */
 } FontMetrics;
 
 static FontMetrics *fontMetrics;
+
+/* The frame rows are composed in before they are copied to the window, shared by every view. */
+static HDC frameDC;
+static HBITMAP frameBitmap;
+static DWORD *framePixels;
+static int frameWidth;       /* pixels per row, FRAME_PADDING more than any window is wide */
+static int frameHeight;
+
+/* Glyphs are copied 16 bytes at a time and may overshoot into the padding; later glyphs and the fill overwrite the rest. */
+#define FRAME_PADDING 8
 
 enum {
     MENU_UNDO = 1,
@@ -73,6 +90,8 @@ typedef struct TextView {
     size_t glyphsCapacity;
     int *advances;
     size_t advancesCapacity;
+    void *composed;          /* the rows scanned for composing, see ComposeRows */
+    size_t composedCapacity;
 } TextView;
 
 typedef struct Place {
@@ -118,10 +137,10 @@ static void MeasureWithFont(void *context, wchar_t first, int *widths)
     ReleaseDC(NULL, dc);
 }
 
-static FontMetrics *AcquireMetrics(HFONT font, int cellWidth)
+static FontMetrics *AcquireMetrics(HFONT font, int cellWidth, int lineHeight)
 {
     for (FontMetrics *entry = fontMetrics; entry != NULL; entry = entry->next) {
-        if (entry->font == font && entry->layout.cellWidth == cellWidth) {
+        if (entry->font == font && entry->layout.cellWidth == cellWidth && entry->lineHeight == lineHeight) {
             ++entry->users;
             return entry;
         }
@@ -132,6 +151,7 @@ static FontMetrics *AcquireMetrics(HFONT font, int cellWidth)
     }
     entry->font = font;
     entry->users = 1;
+    entry->lineHeight = lineHeight;
     LayoutMetricsInitialize(&entry->layout, cellWidth, MeasureWithFont, font);
     entry->next = fontMetrics;
     fontMetrics = entry;
@@ -150,8 +170,97 @@ static void ReleaseMetrics(FontMetrics *entry)
     if (*link != NULL) {
         *link = entry->next;
     }
+    for (int i = 0; i < ATLAS_COLORS; ++i) {
+        GlyphAtlasRelease(entry->atlases[i]);
+    }
     LayoutMetricsRelease(&entry->layout);
     MemFree(entry);
+}
+
+/* The glyph bitmaps of the font in these colors; the least recently made pair gives way when all slots are taken. */
+static GlyphAtlas *AtlasFor(FontMetrics *entry, COLORREF text, COLORREF background)
+{
+    int free = -1;
+    for (int i = 0; i < ATLAS_COLORS; ++i) {
+        GlyphAtlas *atlas = entry->atlases[i];
+        if (atlas != NULL && atlas->text == text && atlas->background == background) {
+            return atlas;
+        }
+        if (atlas == NULL && free < 0) {
+            free = i;
+        }
+    }
+    if (free < 0) {
+        free = ATLAS_COLORS - 1;
+        GlyphAtlasRelease(entry->atlases[free]);
+        entry->atlases[free] = NULL;
+    }
+    entry->atlases[free] = GlyphAtlasCreate(entry->font, &entry->layout, entry->lineHeight, text, background);
+    return entry->atlases[free];
+}
+
+/* A frame at least width by height pixels; FALSE when it cannot be made. */
+static BOOL EnsureFrame(int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        return FALSE;
+    }
+    width += FRAME_PADDING;
+    if (framePixels != NULL && width <= frameWidth && height <= frameHeight) {
+        return TRUE;
+    }
+    int newWidth = width > frameWidth ? width : frameWidth;
+    int newHeight = height > frameHeight ? height : frameHeight;
+    if (frameDC == NULL) {
+        frameDC = CreateCompatibleDC(NULL);
+        if (frameDC == NULL) {
+            return FALSE;
+        }
+    }
+    BITMAPINFO info = { 0 };
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = newWidth;
+    info.bmiHeader.biHeight = -newHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    void *bits = NULL;
+    HBITMAP bitmap = CreateDIBSection(frameDC, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (bitmap == NULL) {
+        return FALSE;
+    }
+    SelectObject(frameDC, bitmap);
+    if (frameBitmap != NULL) {
+        DeleteObject(frameBitmap);
+    }
+    frameBitmap = bitmap;
+    framePixels = bits;
+    frameWidth = newWidth;
+    frameHeight = newHeight;
+    return TRUE;
+}
+
+static DWORD PixelOf(COLORREF color)
+{
+    return ((DWORD)GetRValue(color) << 16) | ((DWORD)GetGValue(color) << 8) | GetBValue(color);
+}
+
+static void FillPixels(DWORD *row, int stride, int left, int right, int lines, DWORD pixel)
+{
+    for (int line = 0; line < lines; ++line, row += stride) {
+        for (int x = left; x < right; ++x) {
+            row[x] = pixel;
+        }
+    }
+}
+
+/* Copies a glyph's pixels 16 bytes at a time, overshooting its width by up to three pixels. */
+static void CopyGlyph(DWORD *destination, int destinationStride, const DWORD *source, int sourceStride, int width, int lines)
+{
+    for (int line = 0; line < lines; ++line, destination += destinationStride, source += sourceStride) {
+        for (int x = 0; x < width; x += 4) {
+            _mm_storeu_si128((__m128i *)(destination + x), _mm_loadu_si128((const __m128i *)(source + x)));
+        }
+    }
 }
 
 /* Tells the parent the caret or selection moved, when it asked for that. */
@@ -993,16 +1102,21 @@ static void FillBox(HDC dc, COLORREF color, long long left, int top, long long r
     ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &box, NULL, 0, NULL);
 }
 
-static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStart, size_t rowEnd, size_t lineStart,
-    BOOL breakAfter, int y, size_t selectionStart, size_t selectionEnd, const Colors *colors, size_t glyphLimit)
+/* The glyphs of a row that are on screen: their characters and advances go to the arrays given. */
+typedef struct RowGlyphs {
+    size_t first;        /* offset in the row text of the first glyph on screen */
+    size_t count;
+    size_t end;          /* offset after the last glyph looked at */
+    long long x;         /* where the first glyph starts, in client pixels */
+    BOOL composable;     /* every glyph has a width and is no surrogate, so it can come from the atlas */
+} RowGlyphs;
+
+static RowGlyphs ScanRow(TextView *view, const wchar_t *text, size_t rowStart, size_t rowEnd, size_t glyphLimit,
+    wchar_t *glyphsOut, int *advancesOut)
 {
-    int charWidth = view->charWidth;
-    int bottom = y + view->lineHeight;
+    RowGlyphs glyphs = { 0 };
     long long origin = view->margin - (view->wordWrap ? 0 : view->scrollX);
     long long x = origin;
-    if (x > 0) {
-        FillBox(dc, colors->background, 0, y, x < view->clientWidth ? x : view->clientWidth, bottom);
-    }
 
     size_t i = rowStart;
     while (i < rowEnd) {
@@ -1014,7 +1128,9 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
         ++i;
     }
 
-    size_t first = i;
+    glyphs.first = i;
+    glyphs.x = x;
+    glyphs.composable = TRUE;
     size_t count = 0;
     while (i < rowEnd && count < glyphLimit) {
         wchar_t ch = text[i];
@@ -1022,35 +1138,48 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
         if (x >= view->clientWidth && width > 0) {
             break;
         }
-        view->glyphs[count] = ch == L'\t' ? L' ' : ch;
-        view->advances[count] = width;
+        glyphsOut[count] = ch == L'\t' ? L' ' : ch;
+        advancesOut[count] = width;
+        glyphs.composable = glyphs.composable && width > 0 && !IS_HIGH_SURROGATE(ch) && !IS_LOW_SURROGATE(ch);
         ++count;
         x += width;
         ++i;
     }
+    glyphs.count = count;
+    glyphs.end = i;
 
     if (!view->wordWrap) {
         long long rowWidth = x - origin;
         size_t remaining = rowEnd - i;
         rowWidth = remaining <= MEASURED_REMAINDER ? LayoutAdvance(view->metrics, text, i, rowEnd, rowWidth)
-                                                   : rowWidth + (long long)remaining * charWidth;
+                                                   : rowWidth + (long long)remaining * view->charWidth;
         if (rowWidth > view->widestRow) {
             view->widestRow = rowWidth;
         }
     }
+    return glyphs;
+}
 
-    long long runX = x;
-    for (size_t k = 0; k < count; k++) {
-        runX -= view->advances[k];
+/* Draws a row with GDI, one text run per stretch of selected or unselected glyphs. */
+static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStart, size_t rowEnd, size_t lineStart,
+    BOOL breakAfter, int y, size_t selectionStart, size_t selectionEnd, const Colors *colors, size_t glyphLimit)
+{
+    int charWidth = view->charWidth;
+    int bottom = y + view->lineHeight;
+    RowGlyphs glyphs = ScanRow(view, text, rowStart, rowEnd, glyphLimit, view->glyphs, view->advances);
+    if (glyphs.x > 0) {
+        FillBox(dc, colors->background, 0, y, glyphs.x < view->clientWidth ? glyphs.x : view->clientWidth, bottom);
     }
+
+    long long runX = glyphs.x;
     size_t k = 0;
-    while (k < count) {
-        size_t position = lineStart + first + k;
+    while (k < glyphs.count) {
+        size_t position = lineStart + glyphs.first + k;
         BOOL selected = position >= selectionStart && position < selectionEnd;
         size_t next = k;
         int width = 0;
-        while (next < count) {
-            size_t nextPosition = lineStart + first + next;
+        while (next < glyphs.count) {
+            size_t nextPosition = lineStart + glyphs.first + next;
             if ((nextPosition >= selectionStart && nextPosition < selectionEnd) != selected) {
                 break;
             }
@@ -1066,7 +1195,7 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
     }
 
     long long end = runX;
-    if (breakAfter && i == rowEnd) {
+    if (breakAfter && glyphs.end == rowEnd) {
         size_t breakPosition = lineStart + rowEnd;
         if (breakPosition >= selectionStart && breakPosition < selectionEnd) {
             FillBox(dc, colors->selectedBackground, end > 0 ? end : 0, y, end + charWidth, bottom);
@@ -1076,6 +1205,220 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
     if (end < view->clientWidth) {
         FillBox(dc, colors->background, end > 0 ? end : 0, y, view->clientWidth, bottom);
     }
+}
+
+/* A row scanned for composing: its glyphs and advances sit in the view's scratch arrays from glyphOffset on. */
+typedef struct ComposedRow {
+    int y;
+    long long x;
+    size_t glyphOffset;
+    size_t count;
+    size_t position;     /* position in the document of the first glyph */
+    BOOL selectBreak;    /* the row ends in a line break that lies inside the selection */
+    int reach;           /* how far the composed row extends, set by ComposeRecord */
+} ComposedRow;
+
+typedef struct ComposeWork {
+    TextView *view;
+    const Colors *colors;
+    GlyphAtlas *plain;
+    GlyphAtlas *highlighted;
+    size_t selectionStart;
+    size_t selectionEnd;
+    ComposedRow *rows;
+} ComposeWork;
+
+/* Composes one scanned row into the frame from the atlases: pure copying, so rows are done on several threads at once. */
+static void ComposeRecord(void *context, size_t index)
+{
+    ComposeWork *work = context;
+    TextView *view = work->view;
+    ComposedRow *record = &work->rows[index];
+    const Colors *colors = work->colors;
+    const wchar_t *glyphs = view->glyphs + record->glyphOffset;
+    const int *advances = view->advances + record->glyphOffset;
+
+    int lines = view->lineHeight;
+    int width = view->clientWidth;
+    int stride = frameWidth;
+    DWORD *row = framePixels + (size_t)record->y * stride;
+    DWORD background = PixelOf(colors->background);
+    long long x = record->x;
+    if (x > 0) {
+        FillPixels(row, stride, 0, x < width ? (int)x : width, lines, background);
+    }
+
+    for (size_t k = 0; k < record->count; ++k) {
+        int advance = advances[k];
+        long long left = x;
+        long long right = x + advance;
+        x = right;
+        if (right <= 0 || left >= width) {
+            continue;
+        }
+        size_t position = record->position + k;
+        BOOL selected = position >= work->selectionStart && position < work->selectionEnd;
+        int clipLeft = left < 0 ? (int)-left : 0;
+        int clipRight = right > width ? (int)(right - width) : 0;
+        int copied = advance - clipLeft - clipRight;
+        if (copied <= 0) {
+            continue;
+        }
+        DWORD *destination = row + left + clipLeft;
+        wchar_t ch = glyphs[k];
+        if (ch == L' ') {
+            /* Spaces and tabs are blank; a tab is wider than the slot the space glyph has. */
+            FillPixels(destination, stride, 0, copied, lines, selected ? PixelOf(colors->selectedBackground) : background);
+            continue;
+        }
+        int sourceStride = 0;
+        const DWORD *source = GlyphAtlasPixels(selected ? work->highlighted : work->plain, ch, &sourceStride);
+        if (source == NULL) {
+            FillPixels(destination, stride, 0, copied, lines, background);
+            continue;
+        }
+        CopyGlyph(destination, stride, source + clipLeft, sourceStride, copied, lines);
+    }
+
+    long long end = x;
+    if (record->selectBreak) {
+        long long cellEnd = end + view->charWidth;
+        FillPixels(row, stride, end > 0 ? (int)end : 0, cellEnd < width ? (int)cellEnd : width, lines, PixelOf(colors->selectedBackground));
+        end = cellEnd;
+    }
+    /* The last glyph may have overshot; the rest of the row is background up to where the copy to the window stops. */
+    int reach = end < width ? (end > 0 ? (int)end : 0) : width;
+    FillPixels(row, stride, reach, reach + FRAME_PADDING < width ? reach + FRAME_PADDING : width, lines, background);
+    record->reach = reach;
+}
+
+/*
+ * Scans a row for composing: its glyphs go to the scratch arrays and every atlas page they need is
+ * drawn now, on this thread. FALSE when the row has to be painted with GDI.
+ */
+static BOOL ScanForCompose(TextView *view, ComposeWork *work, ComposedRow *record, const wchar_t *text, size_t rowStart, size_t rowEnd,
+    size_t lineStart, BOOL breakAfter, int y, size_t glyphLimit, size_t glyphOffset)
+{
+    RowGlyphs glyphs = ScanRow(view, text, rowStart, rowEnd, glyphLimit, view->glyphs + glyphOffset, view->advances + glyphOffset);
+    if (!glyphs.composable) {
+        return FALSE;
+    }
+    size_t breakPosition = lineStart + rowEnd;
+    record->y = y;
+    record->x = glyphs.x;
+    record->glyphOffset = glyphOffset;
+    record->count = glyphs.count;
+    record->position = lineStart + glyphs.first;
+    record->selectBreak = breakAfter && glyphs.end == rowEnd && breakPosition >= work->selectionStart && breakPosition < work->selectionEnd;
+    record->reach = 0;
+    for (size_t k = 0; k < glyphs.count; ++k) {
+        size_t position = record->position + k;
+        BOOL selected = position >= work->selectionStart && position < work->selectionEnd;
+        if (selected && work->highlighted == NULL) {
+            work->highlighted = AtlasFor(view->shared, work->colors->selectedText, work->colors->selectedBackground);
+        }
+        GlyphAtlas *atlas = selected ? work->highlighted : work->plain;
+        if (atlas == NULL || !GlyphAtlasPrepare(atlas, view->glyphs[glyphOffset + k])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Paints the rows of the area with GDI, one at a time. */
+static void PaintRows(TextView *view, HDC dc, const RECT *area, const Colors *colors, size_t selectionStart, size_t selectionEnd,
+    size_t visibleGlyphs, int *bottom)
+{
+    size_t lineCount = DocumentLineCount(&view->document);
+    int y = 0;
+    size_t line = view->topLine;
+    size_t row = view->topRow;
+    while (y < area->bottom && line < lineCount) {
+        size_t length = 0;
+        const wchar_t *text = LineText(view, line, &length);
+        size_t rowCount = LineRows(view, text, length);
+        size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
+        size_t lineStart = DocumentLineStart(&view->document, line);
+        for (; row < rowCount && y < area->bottom; ++row, y += view->lineHeight) {
+            if (y + view->lineHeight <= area->top) {
+                continue;
+            }
+            size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
+            PaintRow(view, dc, text, view->rows[row], rowEnd, lineStart, row + 1 == rowCount && line + 1 < lineCount,
+                y, selectionStart, selectionEnd, colors, glyphLimit);
+        }
+        row = 0;
+        ++line;
+    }
+    *bottom = y;
+}
+
+/*
+ * Scans the rows of the area and composes them into the frame on the worker threads, then copies
+ * them to the window in one go, as wide as the widest of them reaches; the rest of the band is one
+ * solid fill. FALSE when a row cannot come from the atlas, in which case nothing was drawn.
+ */
+static BOOL ComposeRows(TextView *view, HDC dc, const RECT *area, const Colors *colors, size_t selectionStart, size_t selectionEnd,
+    size_t visibleGlyphs, int *bottom)
+{
+    size_t rowsOnScreen = (size_t)PartialRows(view) + 1;
+    /* The frame is one row taller than the window, so the row cut off at the bottom is composed like the others. */
+    if (view->shared == NULL || !EnsureFrame(view->clientWidth, view->clientHeight + view->lineHeight)
+        || !GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, rowsOnScreen * visibleGlyphs, sizeof(wchar_t))
+        || !GrowScratch((void **)&view->advances, &view->advancesCapacity, rowsOnScreen * visibleGlyphs, sizeof(int))
+        || !GrowScratch(&view->composed, &view->composedCapacity, rowsOnScreen, sizeof(ComposedRow))) {
+        return FALSE;
+    }
+    ComposeWork work = { view, colors, AtlasFor(view->shared, colors->text, colors->background), NULL, selectionStart, selectionEnd, view->composed };
+    if (work.plain == NULL) {
+        return FALSE;
+    }
+
+    size_t lineCount = DocumentLineCount(&view->document);
+    size_t composedCount = 0;
+    size_t glyphOffset = 0;
+    int y = 0;
+    size_t line = view->topLine;
+    size_t row = view->topRow;
+    while (y < area->bottom && line < lineCount) {
+        size_t length = 0;
+        const wchar_t *text = LineText(view, line, &length);
+        size_t rowCount = LineRows(view, text, length);
+        size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
+        size_t lineStart = DocumentLineStart(&view->document, line);
+        for (; row < rowCount && y < area->bottom; ++row, y += view->lineHeight) {
+            if (y + view->lineHeight <= area->top) {
+                continue;
+            }
+            size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
+            BOOL breakAfter = row + 1 == rowCount && line + 1 < lineCount;
+            if (composedCount >= rowsOnScreen || y + view->lineHeight > frameHeight
+                || !ScanForCompose(view, &work, &work.rows[composedCount], text, view->rows[row], rowEnd, lineStart, breakAfter, y, glyphLimit, glyphOffset)) {
+                return FALSE;
+            }
+            glyphOffset += work.rows[composedCount].count;
+            ++composedCount;
+        }
+        row = 0;
+        ++line;
+    }
+    *bottom = y;
+    if (composedCount == 0) {
+        return TRUE;
+    }
+
+    TRACE("rows scanned");
+    WorkersRun(ComposeRecord, &work, composedCount);
+    TRACE("rows composed");
+    int top = work.rows[0].y;
+    int right = 0;
+    for (size_t i = 0; i < composedCount; ++i) {
+        right = work.rows[i].reach > right ? work.rows[i].reach : right;
+    }
+    BitBlt(dc, 0, top, right, y - top, frameDC, 0, top, SRCCOPY);
+    TRACE("frame copied");
+    FillBox(dc, colors->background, right, top, view->clientWidth, y);
+    return TRUE;
 }
 
 static void PaintArea(TextView *view, HDC dc, const RECT *area)
@@ -1090,37 +1433,20 @@ static void PaintArea(TextView *view, HDC dc, const RECT *area)
 
     /* A glyph is at least a pixel wide, so a row never needs more glyphs than the window has pixels. */
     size_t visibleGlyphs = (size_t)(view->clientWidth > 0 ? view->clientWidth : 0) + VISIBLE_GLYPH_SLACK;
-    size_t lineCount = DocumentLineCount(&view->document);
-    int y = 0;
-    size_t line = view->topLine;
-    size_t row = view->topRow;
-    while (y < area->bottom && line < lineCount) {
-        size_t length = 0;
-        const wchar_t *text = LineText(view, line, &length);
-        size_t rowCount = LineRows(view, text, length);
-        size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
-        if (!GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, glyphLimit, sizeof(wchar_t))
-            || !GrowScratch((void **)&view->advances, &view->advancesCapacity, glyphLimit, sizeof(int))) {
-            break;
+    int bottom = 0;
+    if (!ComposeRows(view, dc, area, &colors, selectionStart, selectionEnd, visibleGlyphs, &bottom)) {
+        if (GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, visibleGlyphs, sizeof(wchar_t))
+            && GrowScratch((void **)&view->advances, &view->advancesCapacity, visibleGlyphs, sizeof(int))) {
+            PaintRows(view, dc, area, &colors, selectionStart, selectionEnd, visibleGlyphs, &bottom);
         }
-        size_t lineStart = DocumentLineStart(&view->document, line);
-        for (; row < rowCount && y < area->bottom; ++row, y += view->lineHeight) {
-            if (y + view->lineHeight <= area->top) {
-                continue;
-            }
-            size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
-            PaintRow(view, dc, text, view->rows[row], rowEnd, lineStart, row + 1 == rowCount && line + 1 < lineCount,
-                y, selectionStart, selectionEnd, &colors, glyphLimit);
-        }
-        row = 0;
-        ++line;
     }
-    if (y < area->bottom) {
-        FillBox(dc, colors.background, 0, y, view->clientWidth > area->right ? view->clientWidth : area->right, area->bottom);
+    if (bottom < area->bottom) {
+        FillBox(dc, colors.background, 0, bottom, view->clientWidth > area->right ? view->clientWidth : area->right, area->bottom);
     }
 
     SetTextAlign(dc, previousAlign);
     SelectObject(dc, previousFont);
+    TRACE("painted rows");
 }
 
 /* ---- Input helpers ------------------------------------------------------------------------- */
@@ -1147,13 +1473,21 @@ static void ApplyFont(TextView *view, HFONT font)
     view->charWidth = extent.cx > 0 ? (extent.cx + sampleLength - 1) / sampleLength : 1;
     view->margin = view->charWidth / 2 > 2 ? view->charWidth / 2 : 2;
 
-    FontMetrics *shared = AcquireMetrics(font, view->charWidth);
+    FontMetrics *shared = AcquireMetrics(font, view->charWidth, view->lineHeight);
     if (shared != NULL) {
         ReleaseMetrics(view->shared);
         view->shared = shared;
         view->metrics = &shared->layout;
     }
     LayoutSetTabCells(view->metrics, view->tabCells);
+    if (view->palette != NULL && view->shared != NULL) {
+        /* The glyphs most text uses are drawn now, so the first row painted with this font copies them. */
+        GlyphAtlas *atlas = AtlasFor(view->shared, view->palette->text, view->palette->background);
+        if (atlas != NULL) {
+            GlyphAtlasPrepareRange(atlas, 0x0020, 0x007E);
+            GlyphAtlasPrepareRange(atlas, 0x00A0, 0x017F);
+        }
+    }
     view->widestRow = 0;
     UpdateWrapWidth(view);
     if (view->focused) {
@@ -1310,6 +1644,7 @@ static void DestroyView(TextView *view)
     MemFree(view->rows);
     MemFree(view->glyphs);
     MemFree(view->advances);
+    MemFree(view->composed);
     MemFree(view);
 }
 
