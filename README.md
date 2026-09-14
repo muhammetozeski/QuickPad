@@ -56,6 +56,10 @@ libraries that are part of Windows.
 - Rows are drawn from glyph bitmaps: each character is drawn by GDI once, the rows on screen are
   composed from those bitmaps on the worker threads and copied to the window in one step. Rows with
   combining marks or characters outside the Basic Multilingual Plane are drawn with GDI
+- The text is presented through the graphics card: the window that opens next gets a
+  DirectComposition visual with a swap chain in idle time, the rows are composed straight into a
+  frame the graphics card copies to the screen buffer, and the window's own surface is never drawn.
+  Where Direct3D 11 is not available, or with `Gpu=0` in `QuickPad.ini`, GDI is used instead
 - Explorer opens associated files through a small in-process shell extension that hands the paths to
   the running host, so no process is started for each file
 - Optional start with Windows: asked on the first run and changeable under **Settings > Start with
@@ -72,6 +76,28 @@ libraries that are part of Windows.
 
 Features that are not used cost nothing: the status bar is off until it is turned on, auto indent is
 off, and a window's menus are built from one shared template the first time they are opened.
+
+## Measurements
+
+Measured with a build that stamps the time of each step (`obj\bench\build_trace.ps1`, a build with
+`QP_TRACE` defined) on an Intel Core i5-8300H laptop with Windows 11, opening a 5 MB UTF-8 text
+file (57,000 lines, Turkish text) into a 1152 by 680 window from a warm pool. The times are the
+host's own work from receiving the file to the moment the window is uncloaked, which is when the
+Desktop Window Manager can show it at its next frame.
+
+| Version | Host work before the window shows | What changed |
+|---|---|---|
+| 1.1.0 | 18-20 ms | The whole file was decoded and indexed before the window appeared |
+| 1.2.0 | 4.4-5.5 ms | Only the first 64 KB is decoded first; the rest on worker threads; memory prepared in advance |
+| 1.3.0 | 1.5-2.0 ms | Rows painted from glyph bitmaps on the worker threads; the next window waits raised and drawn |
+| 1.4.0 | 1.0-1.2 ms | The text is presented through the graphics card instead of GDI |
+
+The 1.4.0 steps: reading and decoding the first part 0.2 ms, the title 0.1 ms, scanning the rows
+0.1 ms, composing them on the worker threads 0.2 ms, handing the frame to the graphics card 0.07 ms,
+presenting 0.17 ms, uncloaking 0.16 ms. With `Gpu=0` the rows are copied to the window with GDI
+instead, which takes the 1.3.0 times. What follows is the operating system's: activating the window
+takes 3-10 ms after that, and the window reaches the screen with the Desktop Window Manager's next
+frame, up to 16.7 ms later on a 60 Hz display.
 
 ## Security Architecture
 
@@ -158,7 +184,7 @@ The running host locks `bin\QuickPad.exe`; exit it from the notification area me
 | `src/main.c` | Entry point, command line, handing launches to the host |
 | `src/host.c` | Resident host window, notification area icon, message loop |
 | `src/editor.c` | Editor windows, window pool, menus, file dialogs, find and replace |
-| `src/textview.c`, `glyphs.c` | The text editing control and the glyph bitmaps it paints rows from |
+| `src/textview.c`, `glyphs.c`, `gpu.c` | The text editing control, the glyph bitmaps it paints rows from, presenting through the graphics card |
 | `src/document.c`, `layout.c`, `history.c`, `search.c` | Gap buffer with line index, glyph width layout and word wrap, undo history, search |
 | `src/textload.c`, `workers.c`, `blocks.c` | Decoding a file in parts on the worker threads, the thread pool, ready memory blocks |
 | `src/text.c`, `fileio.c` | Encoding detection and conversion, reading and saving files |
