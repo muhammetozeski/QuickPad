@@ -7,7 +7,8 @@
  * the file name to become visible (shown or uncloaked, and not cloaked). It then asks that window
  * to close and waits until it is hidden or cloaked again. With --pool N the tool first waits until
  * N QuickPad editor windows exist, so the runs measure a warm pool. --interval waits that many
- * milliseconds between runs instead of waiting for the pool to be full again.
+ * milliseconds between runs instead of waiting for the pool to be full again. --hold keeps each
+ * window open for that many milliseconds before closing it.
  *
  * --shell opens the file through ShellExecuteExW and its association. Use it only for a file type
  * QuickPad is already the default for: Windows asks the user to pick an app for any other type.
@@ -161,9 +162,12 @@ int wmain(int argc, wchar_t **argv)
     BOOL com = FALSE;
     const wchar_t *dllPath = NULL;
     int interval = -1;
+    int hold = 0;
     for (int i = 3; i < argc; ++i) {
         if (wcscmp(argv[i], L"--pool") == 0 && i + 1 < argc) {
             pool = _wtoi(argv[i + 1]);
+        } else if (wcscmp(argv[i], L"--hold") == 0 && i + 1 < argc) {
+            hold = _wtoi(argv[i + 1]);
         } else if (wcscmp(argv[i], L"--shell") == 0) {
             shell = TRUE;
         } else if (wcscmp(argv[i], L"--com") == 0) {
@@ -305,6 +309,16 @@ int wmain(int argc, wchar_t **argv)
 
             DWORD_PTR result;
             SendMessageTimeoutW(shownWindow, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 10000, &result);
+            if (hold > 0) {
+                DWORD holdStart = GetTickCount();
+                while (GetTickCount() - holdStart < (DWORD)hold) {
+                    MsgWaitForMultipleObjects(0, NULL, FALSE, hold - (GetTickCount() - holdStart), QS_ALLINPUT);
+                    MSG pending;
+                    while (PeekMessageW(&pending, NULL, 0, 0, PM_REMOVE)) {
+                        DispatchMessageW(&pending);
+                    }
+                }
+            }
             PostMessageW(shownWindow, WM_CLOSE, 0, 0);
             PumpUntil(WindowGone, 10000);
         }
