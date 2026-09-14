@@ -49,6 +49,18 @@ void TextViewStartLoad(HWND view);
 /* TRUE while a load is still being decoded. */
 BOOL TextViewIsLoading(HWND view);
 
+/*
+ * Makes the view present its rows through the graphics card (see gpu.h) from the next paint on;
+ * FALSE when that is not available. Release returns the view to painting with GDI. A view that
+ * presents through the graphics card draws its own caret.
+ */
+BOOL TextViewPrepareGpu(HWND view);
+void TextViewReleaseGpu(HWND view);
+BOOL TextViewUsesGpu(HWND view);
+
+/* Presents the whole view now, without a paint message; FALSE when it does not present through the graphics card. */
+BOOL TextViewPresent(HWND view);
+
 void TextViewClear(HWND view);
 
 /* The whole text with L'\n' line breaks, null-terminated, valid until the text changes. */

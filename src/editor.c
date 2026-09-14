@@ -327,6 +327,8 @@ static void ResetEditor(Editor *editor)
 {
     TRACE("reset");
     editor->dirty = FALSE;
+    /* A parked window keeps no graphics card surface; the one that opens next gets one again in idle time. */
+    TextViewReleaseGpu(editor->view);
     TextViewClear(editor->view);
     TRACE("TextViewClear");
     SetPath(editor, NULL);
@@ -392,7 +394,10 @@ static void ShowEditor(Editor *editor)
         editor->raised = TRUE;
         TRACE("SetWindowPos");
     }
-    RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    /* A view presenting through the graphics card is presented straight away; the frame around it was drawn in idle time. */
+    if (!TextViewPresent(editor->view)) {
+        RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
     TRACE("RedrawWindow");
     SetCloaked(window, FALSE);
     TRACE("uncloak");
@@ -1872,7 +1877,10 @@ BOOL EditorIdle(DWORD *wait)
             SetWindowPos(next->window, HWND_TOPMOST, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
                 SWP_NOACTIVATE | (moves ? 0 : SWP_NOMOVE | SWP_NOSIZE));
             next->raised = TRUE;
-            /* The first drawing after a window moved or changed place in the z-order is slow; it happens here, not when a file opens. */
+            /* Its text is presented through the graphics card from here on, and the first, slow drawing after the move happens now. */
+            if (settings.gpu) {
+                TextViewPrepareGpu(next->view);
+            }
             RedrawWindow(next->window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
             return TRUE;
         }

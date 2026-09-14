@@ -16,6 +16,7 @@ typedef struct Settings {
     BOOL autoIndent;
     BOOL statusBar;
     int readyMemoryMB;      /* memory kept mapped and ready for the text of the next files */
+    BOOL gpu;               /* present text through the graphics card instead of GDI; Gpu=0 turns it off */
 } Settings;
 
 #define SETTINGS_READY_MEMORY_DEFAULT 128

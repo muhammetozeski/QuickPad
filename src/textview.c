@@ -1,6 +1,7 @@
 #include "textview.h"
 #include "document.h"
 #include "glyphs.h"
+#include "gpu.h"
 #include "history.h"
 #include "layout.h"
 #include "quickpad.h"
@@ -14,6 +15,7 @@
 
 #define AUTOSCROLL_TIMER 1
 #define AUTOSCROLL_INTERVAL 40
+#define CARET_TIMER 2
 #define VISIBLE_GLYPH_SLACK 256
 
 /* A painted row longer than this beyond the window has the rest of its width estimated from its length. */
@@ -90,8 +92,14 @@ typedef struct TextView {
     size_t glyphsCapacity;
     int *advances;
     size_t advancesCapacity;
-    void *composed;          /* the rows scanned for composing, see ComposeRows */
+    void *composed;          /* the rows scanned for painting, see ScanRows */
     size_t composedCapacity;
+    GpuSurface *gpu;         /* present through the graphics card while this exists */
+    BOOL gpuFailed;          /* the surface stopped working; GDI from then on */
+    BOOL caretOn;            /* the caret drawn into presented frames is in its visible blink phase */
+    BOOL caretPlaced;        /* caretX and caretY hold a position inside the window */
+    int caretX;
+    int caretY;
 } TextView;
 
 typedef struct Place {
@@ -602,6 +610,13 @@ static void UpdateScrollBars(TextView *view)
     SetScrollInfo(view->window, SB_HORZ, &info, TRUE);
 }
 
+/* The caret's rectangle in the window, for invalidating it when the view draws the caret itself. */
+static RECT CaretBox(const TextView *view)
+{
+    RECT box = { view->caretX, view->caretY, view->caretX + CaretWidth(), view->caretY + view->lineHeight };
+    return box;
+}
+
 static void UpdateCaret(TextView *view)
 {
     if (!view->focused) {
@@ -611,10 +626,27 @@ static void UpdateCaret(TextView *view)
     int rows = PartialRows(view);
     long long distance = RowsBetween(view, view->topLine, view->topRow, place.line, place.row, rows + 1);
     long long x = view->margin + place.x - (view->wordWrap ? 0 : view->scrollX);
+    BOOL wasPlaced = view->caretPlaced;
+    RECT was = CaretBox(view);
     if (distance < 0 || distance > rows || x < -view->charWidth || x > (long long)view->clientWidth + view->charWidth) {
         SetCaretPos(-32000, -32000);
+        view->caretPlaced = FALSE;
     } else {
         SetCaretPos((int)x, (int)distance * view->lineHeight);
+        view->caretPlaced = TRUE;
+        view->caretX = (int)x;
+        view->caretY = (int)distance * view->lineHeight;
+    }
+    if (view->gpu != NULL) {
+        /* The presented frames hold the caret, so its old and new places are drawn again. */
+        view->caretOn = TRUE;
+        if (wasPlaced) {
+            InvalidateRect(view->window, &was, FALSE);
+        }
+        if (view->caretPlaced) {
+            RECT now = CaretBox(view);
+            InvalidateRect(view->window, &now, FALSE);
+        }
     }
 }
 
@@ -1207,11 +1239,14 @@ static void PaintRow(TextView *view, HDC dc, const wchar_t *text, size_t rowStar
     }
 }
 
-/* A row scanned for composing: its glyphs and advances sit in the view's scratch arrays from glyphOffset on. */
+/* A row scanned for painting: composed from the atlas, or drawn with GDI when it cannot be. */
 typedef struct ComposedRow {
     int y;
+    BOOL gdi;            /* drawn with GDI: the row has a zero-width character or a surrogate */
+    size_t line;         /* for GDI rows: which line and row of it */
+    size_t row;
     long long x;
-    size_t glyphOffset;
+    size_t glyphOffset;  /* for composed rows: their glyphs and advances in the view's scratch arrays */
     size_t count;
     size_t position;     /* position in the document of the first glyph */
     BOOL selectBreak;    /* the row ends in a line break that lies inside the selection */
@@ -1226,6 +1261,11 @@ typedef struct ComposeWork {
     size_t selectionStart;
     size_t selectionEnd;
     ComposedRow *rows;
+    size_t count;
+    DWORD *frame;        /* where the rows go: the shared frame, or the surface's frame */
+    int stride;
+    int bottom;          /* below the last row scanned */
+    BOOL wholeRows;      /* fill each row to the window's width, for a frame that holds nothing from before */
 } ComposeWork;
 
 /* Composes one scanned row into the frame from the atlases: pure copying, so rows are done on several threads at once. */
@@ -1234,14 +1274,17 @@ static void ComposeRecord(void *context, size_t index)
     ComposeWork *work = context;
     TextView *view = work->view;
     ComposedRow *record = &work->rows[index];
+    if (record->gdi) {
+        return;
+    }
     const Colors *colors = work->colors;
     const wchar_t *glyphs = view->glyphs + record->glyphOffset;
     const int *advances = view->advances + record->glyphOffset;
 
     int lines = view->lineHeight;
     int width = view->clientWidth;
-    int stride = frameWidth;
-    DWORD *row = framePixels + (size_t)record->y * stride;
+    int stride = work->stride;
+    DWORD *row = work->frame + (size_t)record->y * stride;
     DWORD background = PixelOf(colors->background);
     long long x = record->x;
     if (x > 0) {
@@ -1288,23 +1331,23 @@ static void ComposeRecord(void *context, size_t index)
     }
     /* The last glyph may have overshot; the rest of the row is background up to where the copy to the window stops. */
     int reach = end < width ? (end > 0 ? (int)end : 0) : width;
-    FillPixels(row, stride, reach, reach + FRAME_PADDING < width ? reach + FRAME_PADDING : width, lines, background);
+    int fillTo = work->wholeRows ? width : (reach + FRAME_PADDING < width ? reach + FRAME_PADDING : width);
+    FillPixels(row, stride, reach, fillTo, lines, background);
     record->reach = reach;
 }
 
 /*
- * Scans a row for composing: its glyphs go to the scratch arrays and every atlas page they need is
- * drawn now, on this thread. FALSE when the row has to be painted with GDI.
+ * Scans a row for composing: its glyphs go to the scratch arrays and every atlas slot they need is
+ * drawn now, on this thread. FALSE when the row has to be drawn with GDI.
  */
 static BOOL ScanForCompose(TextView *view, ComposeWork *work, ComposedRow *record, const wchar_t *text, size_t rowStart, size_t rowEnd,
-    size_t lineStart, BOOL breakAfter, int y, size_t glyphLimit, size_t glyphOffset)
+    size_t lineStart, BOOL breakAfter, size_t glyphLimit, size_t glyphOffset)
 {
     RowGlyphs glyphs = ScanRow(view, text, rowStart, rowEnd, glyphLimit, view->glyphs + glyphOffset, view->advances + glyphOffset);
     if (!glyphs.composable) {
         return FALSE;
     }
     size_t breakPosition = lineStart + rowEnd;
-    record->y = y;
     record->x = glyphs.x;
     record->glyphOffset = glyphOffset;
     record->count = glyphs.count;
@@ -1325,7 +1368,71 @@ static BOOL ScanForCompose(TextView *view, ComposeWork *work, ComposedRow *recor
     return TRUE;
 }
 
-/* Paints the rows of the area with GDI, one at a time. */
+/* Scans the rows of the area into work->rows; FALSE when the scratch memory for them cannot be had. */
+static BOOL ScanRows(TextView *view, const RECT *area, ComposeWork *work, size_t visibleGlyphs)
+{
+    size_t rowsOnScreen = (size_t)PartialRows(view) + 1;
+    if (view->shared == NULL
+        || !GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, rowsOnScreen * visibleGlyphs, sizeof(wchar_t))
+        || !GrowScratch((void **)&view->advances, &view->advancesCapacity, rowsOnScreen * visibleGlyphs, sizeof(int))
+        || !GrowScratch(&view->composed, &view->composedCapacity, rowsOnScreen, sizeof(ComposedRow))) {
+        return FALSE;
+    }
+    work->plain = AtlasFor(view->shared, work->colors->text, work->colors->background);
+    work->rows = view->composed;
+    work->count = 0;
+    if (work->plain == NULL) {
+        return FALSE;
+    }
+
+    size_t lineCount = DocumentLineCount(&view->document);
+    size_t glyphOffset = 0;
+    int y = 0;
+    size_t line = view->topLine;
+    size_t row = view->topRow;
+    while (y < area->bottom && line < lineCount && work->count < rowsOnScreen) {
+        size_t length = 0;
+        const wchar_t *text = LineText(view, line, &length);
+        size_t rowCount = LineRows(view, text, length);
+        size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
+        size_t lineStart = DocumentLineStart(&view->document, line);
+        for (; row < rowCount && y < area->bottom && work->count < rowsOnScreen; ++row, y += view->lineHeight) {
+            if (y + view->lineHeight <= area->top) {
+                continue;
+            }
+            size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
+            BOOL breakAfter = row + 1 == rowCount && line + 1 < lineCount;
+            ComposedRow *record = &work->rows[work->count++];
+            record->y = y;
+            record->line = line;
+            record->row = row;
+            record->gdi = !ScanForCompose(view, work, record, text, view->rows[row], rowEnd, lineStart, breakAfter, glyphLimit, glyphOffset);
+            if (!record->gdi) {
+                glyphOffset += record->count;
+            }
+        }
+        row = 0;
+        ++line;
+    }
+    work->bottom = y;
+    return TRUE;
+}
+
+/* Draws a scanned row that the atlas could not compose, with GDI, into dc. */
+static void PaintGdiRow(TextView *view, HDC dc, const ComposedRow *record, const Colors *colors, size_t selectionStart, size_t selectionEnd,
+    size_t visibleGlyphs)
+{
+    size_t lineCount = DocumentLineCount(&view->document);
+    size_t length = 0;
+    const wchar_t *text = LineText(view, record->line, &length);
+    size_t rowCount = LineRows(view, text, length);
+    size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
+    size_t rowEnd = record->row + 1 < rowCount ? view->rows[record->row + 1] : length;
+    PaintRow(view, dc, text, view->rows[record->row], rowEnd, DocumentLineStart(&view->document, record->line),
+        record->row + 1 == rowCount && record->line + 1 < lineCount, record->y, selectionStart, selectionEnd, colors, glyphLimit);
+}
+
+/* Paints the rows of the area with GDI, one at a time, for when the rows cannot be scanned. */
 static void PaintRows(TextView *view, HDC dc, const RECT *area, const Colors *colors, size_t selectionStart, size_t selectionEnd,
     size_t visibleGlyphs, int *bottom)
 {
@@ -1353,74 +1460,27 @@ static void PaintRows(TextView *view, HDC dc, const RECT *area, const Colors *co
     *bottom = y;
 }
 
-/*
- * Scans the rows of the area and composes them into the frame on the worker threads, then copies
- * them to the window in one go, as wide as the widest of them reaches; the rest of the band is one
- * solid fill. FALSE when a row cannot come from the atlas, in which case nothing was drawn.
- */
-static BOOL ComposeRows(TextView *view, HDC dc, const RECT *area, const Colors *colors, size_t selectionStart, size_t selectionEnd,
-    size_t visibleGlyphs, int *bottom)
+/* The widest reach of the composed rows and their band, for copying them; FALSE when none was composed. */
+static BOOL ComposedBand(const ComposeWork *work, int lineHeight, int *top, int *bottom, int *right)
 {
-    size_t rowsOnScreen = (size_t)PartialRows(view) + 1;
-    /* The frame is one row taller than the window, so the row cut off at the bottom is composed like the others. */
-    if (view->shared == NULL || !EnsureFrame(view->clientWidth, view->clientHeight + view->lineHeight)
-        || !GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, rowsOnScreen * visibleGlyphs, sizeof(wchar_t))
-        || !GrowScratch((void **)&view->advances, &view->advancesCapacity, rowsOnScreen * visibleGlyphs, sizeof(int))
-        || !GrowScratch(&view->composed, &view->composedCapacity, rowsOnScreen, sizeof(ComposedRow))) {
-        return FALSE;
-    }
-    ComposeWork work = { view, colors, AtlasFor(view->shared, colors->text, colors->background), NULL, selectionStart, selectionEnd, view->composed };
-    if (work.plain == NULL) {
-        return FALSE;
-    }
-
-    size_t lineCount = DocumentLineCount(&view->document);
-    size_t composedCount = 0;
-    size_t glyphOffset = 0;
-    int y = 0;
-    size_t line = view->topLine;
-    size_t row = view->topRow;
-    while (y < area->bottom && line < lineCount) {
-        size_t length = 0;
-        const wchar_t *text = LineText(view, line, &length);
-        size_t rowCount = LineRows(view, text, length);
-        size_t glyphLimit = length + 1 < visibleGlyphs ? length + 1 : visibleGlyphs;
-        size_t lineStart = DocumentLineStart(&view->document, line);
-        for (; row < rowCount && y < area->bottom; ++row, y += view->lineHeight) {
-            if (y + view->lineHeight <= area->top) {
-                continue;
-            }
-            size_t rowEnd = row + 1 < rowCount ? view->rows[row + 1] : length;
-            BOOL breakAfter = row + 1 == rowCount && line + 1 < lineCount;
-            if (composedCount >= rowsOnScreen || y + view->lineHeight > frameHeight
-                || !ScanForCompose(view, &work, &work.rows[composedCount], text, view->rows[row], rowEnd, lineStart, breakAfter, y, glyphLimit, glyphOffset)) {
-                return FALSE;
-            }
-            glyphOffset += work.rows[composedCount].count;
-            ++composedCount;
+    BOOL any = FALSE;
+    *right = 0;
+    for (size_t i = 0; i < work->count; ++i) {
+        const ComposedRow *record = &work->rows[i];
+        if (record->gdi) {
+            continue;
         }
-        row = 0;
-        ++line;
+        if (!any) {
+            *top = record->y;
+        }
+        *bottom = record->y + lineHeight;
+        *right = record->reach > *right ? record->reach : *right;
+        any = TRUE;
     }
-    *bottom = y;
-    if (composedCount == 0) {
-        return TRUE;
-    }
-
-    TRACE("rows scanned");
-    WorkersRun(ComposeRecord, &work, composedCount);
-    TRACE("rows composed");
-    int top = work.rows[0].y;
-    int right = 0;
-    for (size_t i = 0; i < composedCount; ++i) {
-        right = work.rows[i].reach > right ? work.rows[i].reach : right;
-    }
-    BitBlt(dc, 0, top, right, y - top, frameDC, 0, top, SRCCOPY);
-    TRACE("frame copied");
-    FillBox(dc, colors->background, right, top, view->clientWidth, y);
-    return TRUE;
+    return any;
 }
 
+/* Paints with GDI: the rows composed into the shared frame are copied to dc, the others drawn on it. */
 static void PaintArea(TextView *view, HDC dc, const RECT *area)
 {
     HGDIOBJ previousFont = SelectObject(dc, view->font);
@@ -1433,20 +1493,127 @@ static void PaintArea(TextView *view, HDC dc, const RECT *area)
 
     /* A glyph is at least a pixel wide, so a row never needs more glyphs than the window has pixels. */
     size_t visibleGlyphs = (size_t)(view->clientWidth > 0 ? view->clientWidth : 0) + VISIBLE_GLYPH_SLACK;
-    int bottom = 0;
-    if (!ComposeRows(view, dc, area, &colors, selectionStart, selectionEnd, visibleGlyphs, &bottom)) {
-        if (GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, visibleGlyphs, sizeof(wchar_t))
-            && GrowScratch((void **)&view->advances, &view->advancesCapacity, visibleGlyphs, sizeof(int))) {
-            PaintRows(view, dc, area, &colors, selectionStart, selectionEnd, visibleGlyphs, &bottom);
+    ComposeWork work = { view, &colors, NULL, NULL, selectionStart, selectionEnd, NULL, 0, NULL, 0, 0, FALSE };
+    /* The frame is one row taller than the window, so the row cut off at the bottom is composed like the others. */
+    if (EnsureFrame(view->clientWidth, view->clientHeight + view->lineHeight) && ScanRows(view, area, &work, visibleGlyphs)) {
+        work.frame = framePixels;
+        work.stride = frameWidth;
+        WorkersRun(ComposeRecord, &work, work.count);
+        int top = 0;
+        int bottom = 0;
+        int right = 0;
+        if (ComposedBand(&work, view->lineHeight, &top, &bottom, &right)) {
+            BitBlt(dc, 0, top, right, bottom - top, frameDC, 0, top, SRCCOPY);
+            FillBox(dc, colors.background, right, top, view->clientWidth, bottom);
         }
+        for (size_t i = 0; i < work.count; ++i) {
+            if (work.rows[i].gdi) {
+                PaintGdiRow(view, dc, &work.rows[i], &colors, selectionStart, selectionEnd, visibleGlyphs);
+            }
+        }
+    } else if (GrowScratch((void **)&view->glyphs, &view->glyphsCapacity, visibleGlyphs, sizeof(wchar_t))
+               && GrowScratch((void **)&view->advances, &view->advancesCapacity, visibleGlyphs, sizeof(int))) {
+        PaintRows(view, dc, area, &colors, selectionStart, selectionEnd, visibleGlyphs, &work.bottom);
     }
-    if (bottom < area->bottom) {
-        FillBox(dc, colors.background, 0, bottom, view->clientWidth > area->right ? view->clientWidth : area->right, area->bottom);
+    if (work.bottom < area->bottom) {
+        FillBox(dc, colors.background, 0, work.bottom, view->clientWidth > area->right ? view->clientWidth : area->right, area->bottom);
     }
 
     SetTextAlign(dc, previousAlign);
     SelectObject(dc, previousFont);
     TRACE("painted rows");
+}
+
+/* The caret as the view draws it itself when it presents through the graphics card. */
+static void DrawCaret(TextView *view, DWORD *frame, int stride, const Colors *colors)
+{
+    if (!view->focused || !view->caretOn || !view->caretPlaced) {
+        return;
+    }
+    int left = view->caretX;
+    int right = left + CaretWidth();
+    int top = view->caretY;
+    int bottom = top + view->lineHeight;
+    left = left < 0 ? 0 : left;
+    right = right > view->clientWidth ? view->clientWidth : right;
+    top = top < 0 ? 0 : top;
+    bottom = bottom > view->clientHeight + view->lineHeight ? view->clientHeight + view->lineHeight : bottom;
+    if (right > left && bottom > top) {
+        FillPixels(frame + (size_t)top * stride, stride, left, right, bottom - top, PixelOf(colors->text));
+    }
+}
+
+/*
+ * Paints through the graphics card: the rows are composed straight into the surface's frame, rows
+ * that need GDI are drawn into the shared frame and copied over, and the frame is presented.
+ * The frame holds nothing from before, so the whole window is composed every time, whatever the
+ * area. FALSE when the surface stopped working; the caller then paints with GDI from there on.
+ */
+static BOOL PaintGpu(TextView *view)
+{
+    int stride = 0;
+    DWORD *frame = GpuSurfaceMap(view->gpu, &stride);
+    if (frame == NULL) {
+        return FALSE;
+    }
+    Colors colors = CurrentColors(view);
+    size_t selectionStart;
+    size_t selectionEnd;
+    Selection(view, &selectionStart, &selectionEnd);
+    size_t visibleGlyphs = (size_t)(view->clientWidth > 0 ? view->clientWidth : 0) + VISIBLE_GLYPH_SLACK;
+    ComposeWork work = { view, &colors, NULL, NULL, selectionStart, selectionEnd, NULL, 0, frame, stride, 0, TRUE };
+    int width = view->clientWidth;
+    int height = view->clientHeight + view->lineHeight;
+    /* Rows start inside the window; the frame's extra row below it holds the one cut off at the bottom. */
+    RECT area = { 0, 0, width, view->clientHeight };
+    if (!ScanRows(view, &area, &work, visibleGlyphs)) {
+        return FALSE;
+    }
+    /* The rows below the text are blank rows: composed like the others, on the worker threads. */
+    size_t rowsOnScreen = (size_t)PartialRows(view) + 1;
+    for (int y = work.bottom; y + view->lineHeight <= height && work.count < rowsOnScreen; y += view->lineHeight) {
+        ComposedRow *record = &work.rows[work.count++];
+        record->y = y;
+        record->gdi = FALSE;
+        record->x = 0;
+        record->count = 0;
+        record->position = 0;
+        record->selectBreak = FALSE;
+        record->reach = 0;
+        work.bottom = y + view->lineHeight;
+    }
+    TRACE("rows scanned");
+    WorkersRun(ComposeRecord, &work, work.count);
+    TRACE("rows composed");
+
+    BOOL anyGdi = FALSE;
+    for (size_t i = 0; i < work.count; ++i) {
+        anyGdi = anyGdi || work.rows[i].gdi;
+    }
+    if (anyGdi && EnsureFrame(width, height)) {
+        HGDIOBJ previousFont = SelectObject(frameDC, view->font);
+        SetTextAlign(frameDC, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+        SetBkMode(frameDC, OPAQUE);
+        for (size_t i = 0; i < work.count; ++i) {
+            if (!work.rows[i].gdi) {
+                continue;
+            }
+            PaintGdiRow(view, frameDC, &work.rows[i], &colors, selectionStart, selectionEnd, visibleGlyphs);
+            GdiFlush();
+            int y = work.rows[i].y;
+            for (int line = 0; line < view->lineHeight && y + line < height; ++line) {
+                memcpy(frame + (size_t)(y + line) * stride, framePixels + (size_t)(y + line) * frameWidth, (size_t)width * sizeof(DWORD));
+            }
+        }
+        SelectObject(frameDC, previousFont);
+    }
+    if (work.bottom < height) {
+        FillPixels(frame + (size_t)work.bottom * stride, stride, 0, width, height - work.bottom, PixelOf(colors.background));
+    }
+    DrawCaret(view, frame, stride, &colors);
+    BOOL presented = GpuSurfacePresent(view->gpu);
+    TRACE("presented");
+    return presented;
 }
 
 /* ---- Input helpers ------------------------------------------------------------------------- */
@@ -1637,6 +1804,7 @@ static void HandleScrollBar(TextView *view, int bar, WPARAM wParam)
 
 static void DestroyView(TextView *view)
 {
+    GpuSurfaceRelease(view->gpu);
     ReleaseMetrics(view->shared);
     DocumentRelease(&view->document);
     HistoryRelease(&view->history);
@@ -1722,16 +1890,32 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
         view->clientWidth = LOWORD(lParam);
         view->clientHeight = HIWORD(lParam);
         UpdateWrapWidth(view);
+        if (view->gpu != NULL && !GpuSurfaceResize(view->gpu, view->clientWidth, view->clientHeight)) {
+            GpuSurfaceRelease(view->gpu);
+            view->gpu = NULL;
+            view->gpuFailed = TRUE;
+        }
         Redraw(view);
         return 0;
 
     case WM_PAINT: {
         long long widest = view->widestRow;
-        PAINTSTRUCT paint;
         TRACE("WM_PAINT");
-        HDC dc = BeginPaint(window, &paint);
-        PaintArea(view, dc, &paint.rcPaint);
-        EndPaint(window, &paint);
+        if (view->gpu != NULL) {
+            /* The window's own surface is never drawn; the frame is presented over it. */
+            ValidateRect(window, NULL);
+            if (!PaintGpu(view)) {
+                GpuSurfaceRelease(view->gpu);
+                view->gpu = NULL;
+                view->gpuFailed = TRUE;
+                InvalidateRect(window, NULL, FALSE);
+            }
+        } else {
+            PAINTSTRUCT paint;
+            HDC dc = BeginPaint(window, &paint);
+            PaintArea(view, dc, &paint.rcPaint);
+            EndPaint(window, &paint);
+        }
         TRACE("painted");
         if (view->widestRow != widest && !view->wordWrap) {
             UpdateScrollBars(view);
@@ -1749,21 +1933,35 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
     case WM_ERASEBKGND:
         return 1;
 
-    case WM_SETFOCUS:
+    case WM_SETFOCUS: {
         view->focused = TRUE;
+        /* The system caret stays for the input method editor and accessibility; with a surface the view draws its own. */
         CreateCaret(window, NULL, CaretWidth(), view->lineHeight);
         UpdateCaret(view);
-        ShowCaret(window);
+        if (view->gpu == NULL) {
+            ShowCaret(window);
+        } else {
+            UINT blink = GetCaretBlinkTime();
+            if (blink != 0 && blink != INFINITE) {
+                SetTimer(window, CARET_TIMER, blink, NULL);
+            }
+        }
         /* Focus only changes the colors of selected text. */
         if (view->anchor != view->caret) {
             InvalidateRect(window, NULL, FALSE);
         }
         return 0;
+    }
 
     case WM_KILLFOCUS:
         view->focused = FALSE;
         HideCaret(window);
         DestroyCaret();
+        KillTimer(window, CARET_TIMER);
+        if (view->gpu != NULL && view->caretPlaced) {
+            RECT box = CaretBox(view);
+            InvalidateRect(window, &box, FALSE);
+        }
         if (view->anchor != view->caret) {
             InvalidateRect(window, NULL, FALSE);
         }
@@ -1837,6 +2035,17 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
             GetCursorPos(&point);
             ScreenToClient(window, &point);
             ExtendSelectionToPoint(view, point.x, point.y);
+        } else if (wParam == CARET_TIMER) {
+            if (view->gpu == NULL || !view->focused || !IsWindowVisible(window)) {
+                KillTimer(window, CARET_TIMER);
+                view->caretOn = TRUE;
+                return 0;
+            }
+            view->caretOn = !view->caretOn;
+            if (view->caretPlaced) {
+                RECT box = CaretBox(view);
+                InvalidateRect(window, &box, FALSE);
+            }
         }
         return 0;
 
@@ -2023,6 +2232,57 @@ void TextViewSetLoad(HWND window, TextLoad *load)
 void TextViewStartLoad(HWND window)
 {
     DocumentStartLoad(&ViewFrom(window)->document);
+}
+
+BOOL TextViewPrepareGpu(HWND window)
+{
+    TextView *view = ViewFrom(window);
+    if (view->gpu != NULL) {
+        return TRUE;
+    }
+    if (view->gpuFailed || view->clientWidth <= 0 || view->clientHeight <= 0) {
+        return FALSE;
+    }
+    view->gpu = GpuSurfaceCreate(window, view->clientWidth, view->clientHeight, FRAME_PADDING, view->lineHeight);
+    if (view->gpu == NULL) {
+        view->gpuFailed = TRUE;
+        return FALSE;
+    }
+    /* Whatever the window's own surface shows is covered from now on; the frame is drawn at the next paint. */
+    InvalidateRect(window, NULL, FALSE);
+    return TRUE;
+}
+
+void TextViewReleaseGpu(HWND window)
+{
+    TextView *view = ViewFrom(window);
+    if (view->gpu != NULL) {
+        GpuSurfaceRelease(view->gpu);
+        view->gpu = NULL;
+        InvalidateRect(window, NULL, FALSE);
+    }
+}
+
+BOOL TextViewUsesGpu(HWND window)
+{
+    return ViewFrom(window)->gpu != NULL;
+}
+
+BOOL TextViewPresent(HWND window)
+{
+    TextView *view = ViewFrom(window);
+    if (view->gpu == NULL) {
+        return FALSE;
+    }
+    ValidateRect(window, NULL);
+    if (!PaintGpu(view)) {
+        GpuSurfaceRelease(view->gpu);
+        view->gpu = NULL;
+        view->gpuFailed = TRUE;
+        InvalidateRect(window, NULL, FALSE);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 BOOL TextViewIsLoading(HWND window)
