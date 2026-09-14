@@ -37,14 +37,22 @@ libraries that are part of Windows.
   the Format menu for the next save
 - Open Containing Folder and Copy Full Path
 - Writes to a temporary file first and swaps it in, so a failed save leaves the original intact
-- Files of 1 MB and more are memory mapped while loading
 - Asks before discarding unsaved changes; a modified document shows `*` in the title
 - Opening a file that is already open brings its window forward
 
 **Opening speed**
 - A resident host process with a notification area icon receives every later launch
 - A pool of drawn, cloaked editor windows (30 by default, 0 to 100) is kept ready; the pool is
-  refilled only after windows have stopped opening and closing for five seconds
+  refilled only after windows have stopped opening and closing for five seconds. The window that
+  opens next already waits at its place on screen, above every other window, so showing it is one
+  step
+- Only the first 64 KB of a file is decoded before its window appears. The rest is read, counted
+  and decoded by worker threads, one per processor, while the window is already on screen; the
+  first key press or scroll waits for them if they are not done yet
+- Text goes into memory blocks the idle host has already committed and touched, so decoding never
+  waits for page faults. `ReadyMemoryMB` in `QuickPad.ini` sets how much is kept ready (128 by default)
+- Closing a window only hides it; clearing its text and parking it in the pool happen in idle time,
+  as does adding the taskbar button of a new window
 - Explorer opens associated files through a small in-process shell extension that hands the paths to
   the running host, so no process is started for each file
 - Optional start with Windows: asked on the first run and changeable under **Settings > Start with
@@ -149,8 +157,9 @@ The running host locks `bin\QuickPad.exe`; exit it from the notification area me
 | `src/editor.c` | Editor windows, window pool, menus, file dialogs, find and replace |
 | `src/textview.c` | The text editing control |
 | `src/document.c`, `layout.c`, `history.c`, `search.c` | Gap buffer with line index, glyph width layout and word wrap, undo history, search |
+| `src/textload.c`, `workers.c`, `blocks.c` | Decoding a file in parts on the worker threads, the thread pool, ready memory blocks |
 | `src/text.c`, `fileio.c` | Encoding detection and conversion, reading and saving files |
 | `src/register.c`, `startup.c`, `settings.c`, `theme.c` | File associations, start with Windows, `QuickPad.ini`, dark theme |
-| `src/lazyload.c`, `nocrt.c` | On-demand binding of system libraries, memory functions without the C runtime |
+| `src/lazyload.c`, `nocrt.c`, `trace.c` | On-demand binding of system libraries, memory functions without the C runtime, timing marks of a `QP_TRACE` build |
 | `shell/QuickPadShell.c` | The Explorer open command |
 | `tests/` | Unit tests and development tools (window snapshot, command sender, open benchmark) |
