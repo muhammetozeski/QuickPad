@@ -2,9 +2,16 @@
 
 #include <windows.h>
 
+/* A trace build (see trace.h) runs beside the regular host under its own names. */
+#ifdef QP_TRACE
+#define HOST_WINDOW_CLASS L"QuickPadTraceHost"
+#define HOST_MUTEX_NAME L"Local\\QuickPadTrace.Host"
+#define HOST_READY_EVENT_NAME L"Local\\QuickPadTrace.HostReady"
+#else
 #define HOST_WINDOW_CLASS L"QuickPadHost"
 #define HOST_MUTEX_NAME L"Local\\QuickPad.Host"
 #define HOST_READY_EVENT_NAME L"Local\\QuickPad.HostReady"
+#endif
 
 /* dwData of WM_COPYDATA sent to the host window. */
 #define HOST_COPY_OPEN 0x51500001 /* lpData: a null-terminated full path */
