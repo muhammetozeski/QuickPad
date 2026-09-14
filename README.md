@@ -53,6 +53,9 @@ libraries that are part of Windows.
   waits for page faults. `ReadyMemoryMB` in `QuickPad.ini` sets how much is kept ready (128 by default)
 - Closing a window only hides it; clearing its text and parking it in the pool happen in idle time,
   as does adding the taskbar button of a new window
+- Rows are drawn from glyph bitmaps: each character is drawn by GDI once, the rows on screen are
+  composed from those bitmaps on the worker threads and copied to the window in one step. Rows with
+  combining marks or characters outside the Basic Multilingual Plane are drawn with GDI
 - Explorer opens associated files through a small in-process shell extension that hands the paths to
   the running host, so no process is started for each file
 - Optional start with Windows: asked on the first run and changeable under **Settings > Start with
@@ -155,7 +158,7 @@ The running host locks `bin\QuickPad.exe`; exit it from the notification area me
 | `src/main.c` | Entry point, command line, handing launches to the host |
 | `src/host.c` | Resident host window, notification area icon, message loop |
 | `src/editor.c` | Editor windows, window pool, menus, file dialogs, find and replace |
-| `src/textview.c` | The text editing control |
+| `src/textview.c`, `glyphs.c` | The text editing control and the glyph bitmaps it paints rows from |
 | `src/document.c`, `layout.c`, `history.c`, `search.c` | Gap buffer with line index, glyph width layout and word wrap, undo history, search |
 | `src/textload.c`, `workers.c`, `blocks.c` | Decoding a file in parts on the worker threads, the thread pool, ready memory blocks |
 | `src/text.c`, `fileio.c` | Encoding detection and conversion, reading and saving files |
