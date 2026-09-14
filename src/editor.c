@@ -1,6 +1,7 @@
 #define COBJMACROS
 
 #include "editor.h"
+#include "blocks.h"
 #include "fileio.h"
 #include "quickpad.h"
 #include "resource.h"
@@ -9,6 +10,8 @@
 #include "strings.h"
 #include "textview.h"
 #include "theme.h"
+#include "trace.h"
+#include "workers.h"
 
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -22,6 +25,9 @@
 #define VIEW_ID 1
 #define ENCODING_GROUP 100
 #define ENCODING_COMBO 101
+
+/* Posted to a shown window after it appears: its taskbar button is added once the queue is empty. */
+#define WM_EDITOR_ADD_TAB (WM_APP + 0x50)
 
 /* Windows waiting in the pool sit here, cloaked, so they never cover anything or take input. */
 #define PARK_POSITION (-32000)
@@ -55,6 +61,8 @@ typedef struct Editor {
     BOOL modifiedShown;
     BOOL shown;
     BOOL pooled;
+    BOOL dirty;              /* closed and hidden, still to be cleared and parked for the pool */
+    BOOL raised;             /* placed above every window while still cloaked, so showing it needs no z-order change */
     BOOL topmost;
     BOOL fullScreen;
     LONG_PTR savedStyle;
@@ -178,11 +186,12 @@ static void SetTaskbarButton(HWND window, BOOL present)
     }
 }
 
+/* Windows in the pool, counting closed ones still to be cleared and parked. */
 static int PoolCount(void)
 {
     int count = 0;
     for (Editor *editor = editors; editor != NULL; editor = editor->next) {
-        count += editor->pooled;
+        count += editor->pooled || editor->dirty;
     }
     return count;
 }
@@ -313,13 +322,37 @@ static Editor *CreateEditor(void)
     return editor;
 }
 
-/* A drawn editor from the pool, or a new one when the pool is empty. */
+/* Turns a closed window back into an empty pooled one. */
+static void ResetEditor(Editor *editor)
+{
+    TRACE("reset");
+    editor->dirty = FALSE;
+    TextViewClear(editor->view);
+    TRACE("TextViewClear");
+    SetPath(editor, NULL);
+    editor->format = TextDefaultFormat();
+    editor->formatChanged = FALSE;
+    UpdateTitle(editor);
+    ParkEditor(editor);
+    TRACE("ParkEditor");
+    TRACE_DUMP("reset");
+}
+
+/* A drawn editor from the pool, a closed one made ready again, or a new one when there is neither. */
 static Editor *TakeEditor(void)
 {
+    Editor *dirty = NULL;
     for (Editor *editor = editors; editor != NULL; editor = editor->next) {
         if (editor->pooled) {
             return editor;
         }
+        if (editor->dirty && dirty == NULL) {
+            dirty = editor;
+        }
+    }
+    if (dirty != NULL) {
+        ResetEditor(dirty);
+        return dirty;
     }
     return CreateEditor();
 }
@@ -343,15 +376,33 @@ static void ShowEditor(Editor *editor)
     RECT current;
     GetWindowRect(window, &current);
     UINT keepFrame = EqualRect(&current, &frame) ? SWP_NOMOVE | SWP_NOSIZE : 0;
+    TRACE(keepFrame != 0 ? "frame kept" : "frame moves");
     editor->pooled = FALSE;
     editor->shown = TRUE;
     lastWindowChange = GetTickCount64();
     SetWindowLongPtrW(window, GWLP_HWNDPARENT, 0);
-    SetWindowPos(window, HWND_TOP, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, SWP_NOACTIVATE | keepFrame);
+    TRACE("owner cleared");
+    /*
+     * The window usually waits at this frame above every other window already (see EditorIdle); a
+     * cloaked window there is neither seen nor hit by the mouse. Otherwise it is put there now.
+     */
+    if (keepFrame == 0 || !editor->raised) {
+        SetWindowPos(window, HWND_TOPMOST, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
+            SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOREDRAW | SWP_DEFERERASE | keepFrame);
+        editor->raised = TRUE;
+        TRACE("SetWindowPos");
+    }
     RedrawWindow(window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    TRACE("RedrawWindow");
     SetCloaked(window, FALSE);
+    TRACE("uncloak");
+    /* The rest of the file is decoded on the worker threads from here on, while the window is already on screen. */
+    TextViewStartLoad(editor->view);
     SetForegroundWindow(window);
-    SetTaskbarButton(window, TRUE);
+    TRACE("SetForegroundWindow");
+    /* Leaving the top band and the taskbar button, a call into Explorer, wait until every file of this launch is on screen. */
+    PostMessageW(window, WM_EDITOR_ADD_TAB, 0, 0);
+    TRACE_DUMP("open");
 }
 
 /* Returns a closed editor to the pool, or destroys it when the pool is full. */
@@ -364,9 +415,10 @@ static void CloseEditor(Editor *editor)
         SetWindowPlacement(window, &editor->savedPlacement);
         editor->fullScreen = FALSE;
     }
-    if (editor->topmost) {
+    if (editor->topmost || editor->raised) {
         SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         editor->topmost = FALSE;
+        editor->raised = FALSE;
     }
     if (findDialog != NULL && findData.hwndOwner == window) {
         DestroyWindow(findDialog);
@@ -384,31 +436,36 @@ static void CloseEditor(Editor *editor)
     }
 
     editor->shown = FALSE;
+    TRACE("close");
     if (!residentProcess || PoolCount() >= settings.poolSize) {
         DestroyWindow(window);
+        TRACE("DestroyWindow");
+        TRACE_DUMP("close (destroyed)");
         return;
     }
 
+    /* The window disappears now; clearing its text and parking it for the pool waits for idle time. */
     SetCloaked(window, TRUE);
+    TRACE("cloak");
     SetTaskbarButton(window, FALSE);
+    TRACE("DeleteTab");
     ShowWindow(window, SW_HIDE);
-    TextViewClear(editor->view);
-    SetPath(editor, NULL);
-    editor->format = TextDefaultFormat();
-    editor->formatChanged = FALSE;
-    UpdateTitle(editor);
-    ParkEditor(editor);
+    TRACE("hide");
+    editor->dirty = TRUE;
+    TRACE_DUMP("close");
 }
 
 /* Loads a file into an editor. A missing file can become a new, empty document with that name. */
 static BOOL LoadInto(Editor *editor, const wchar_t *path)
 {
-    wchar_t *text = NULL;
-    size_t length = 0;
-    TextFormat format = TextDefaultFormat();
+    TextLoad *load = NULL;
     DWORD error = 0;
 
-    if (!FileLoad(path, &text, &length, &format, &error)) {
+    /* The load writes the detected format into the editor and decodes the rest while the window shows. */
+    TRACE("LoadInto");
+    BOOL begun = FileBeginLoad(path, &editor->format, editor->view, WM_TEXTVIEW_LOAD_DONE, &load, &error);
+    TRACE("FileBeginLoad");
+    if (!begun) {
         if (error != ERROR_FILE_NOT_FOUND) {
             ShowFileError(editor, path, error);
             return FALSE;
@@ -421,16 +478,19 @@ static BOOL LoadInto(Editor *editor, const wchar_t *path)
             return FALSE;
         }
         TextViewClear(editor->view);
-    } else if (!TextViewSetText(editor->view, text, length)) {
-        MemFree(text);
-        ShowFileError(editor, path, ERROR_NOT_ENOUGH_MEMORY);
-        return FALSE;
+        editor->format = TextDefaultFormat();
+    } else {
+        TextViewSetLoad(editor->view, load);
+        TRACE("TextViewSetLoad");
+        if (editor->shown) {
+            TextViewStartLoad(editor->view);
+        }
     }
 
     SetPath(editor, path);
-    editor->format = format;
     editor->formatChanged = FALSE;
     UpdateTitle(editor);
+    TRACE("UpdateTitle");
     return TRUE;
 }
 
@@ -1563,6 +1623,17 @@ static LRESULT CALLBACK EditorProc(HWND window, UINT message, WPARAM wParam, LPA
         SetFocus(editor->view);
         return 0;
 
+    case WM_EDITOR_ADD_TAB:
+        if (editor->shown) {
+            if (editor->raised && !editor->topmost) {
+                /* Active by now, so it stays on top of the other windows without the topmost flag. */
+                SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            editor->raised = FALSE;
+            SetTaskbarButton(window, TRUE);
+        }
+        return 0;
+
     case WM_COMMAND:
         if (HIWORD(wParam) == TEXTVIEW_SELECTION_CHANGED && (HWND)lParam == editor->view) {
             UpdateStatus(editor);
@@ -1694,6 +1765,8 @@ BOOL EditorInitialize(HINSTANCE instance)
     }
     ThemeInitialize();
     SettingsLoad();
+    BlockSetBudget((size_t)settings.readyMemoryMB << 20);
+    WorkersInitialize();
 
     WNDCLASSEXW windowClass = { sizeof windowClass };
     windowClass.lpfnWndProc = EditorProc;
@@ -1717,6 +1790,7 @@ BOOL EditorInitialize(HINSTANCE instance)
 
 BOOL EditorOpenFile(const wchar_t *path)
 {
+    TRACE("EditorOpenFile");
     Editor *existing = FindByPath(path);
     if (existing != NULL) {
         ShowEditor(existing);
@@ -1725,6 +1799,7 @@ BOOL EditorOpenFile(const wchar_t *path)
 
     /* A pooled editor that fails to load stays in the pool. */
     Editor *editor = TakeEditor();
+    TRACE("TakeEditor");
     if (editor == NULL || !LoadInto(editor, path)) {
         return FALSE;
     }
@@ -1748,6 +1823,23 @@ BOOL EditorIdle(DWORD *wait)
     if (!residentProcess) {
         return FALSE;
     }
+
+    /* Closed windows are cleared and parked first; a pool already full loses them instead. */
+    for (Editor *editor = editors; editor != NULL; editor = editor->next) {
+        if (editor->dirty) {
+            if (PoolCount() > settings.poolSize) {
+                editor->dirty = FALSE;
+                DestroyWindow(editor->window);
+            } else {
+                ResetEditor(editor);
+            }
+            return TRUE;
+        }
+    }
+    if (BlockPrepare()) {
+        return TRUE;
+    }
+
     ULONGLONG now = GetTickCount64();
     if (lastWindowChange != 0 && now < lastWindowChange + POOL_QUIET_PERIOD) {
         *wait = (DWORD)(lastWindowChange + POOL_QUIET_PERIOD - now);
@@ -1770,15 +1862,19 @@ BOOL EditorIdle(DWORD *wait)
         return CreateEditor() != NULL;
     }
 
-    /* The window TakeEditor hands out next waits, cloaked, where the next window will open. */
+    /* The window TakeEditor hands out next waits, cloaked, where the next window will open, above every other window. */
     if (next != NULL) {
         RECT frame = NewWindowFrame();
         RECT current;
         GetWindowRect(next->window, &current);
-        if (!EqualRect(&current, &frame)) {
-            SetWindowPos(next->window, NULL, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
-                SWP_NOACTIVATE | SWP_NOZORDER);
-            RedrawWindow(next->window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        BOOL moves = !EqualRect(&current, &frame);
+        if (moves || !next->raised) {
+            SetWindowPos(next->window, HWND_TOPMOST, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top,
+                SWP_NOACTIVATE | (moves ? 0 : SWP_NOMOVE | SWP_NOSIZE));
+            next->raised = TRUE;
+            if (moves) {
+                RedrawWindow(next->window, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            }
             return TRUE;
         }
     }

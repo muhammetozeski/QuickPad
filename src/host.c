@@ -1,4 +1,5 @@
 #include "host.h"
+#include "blocks.h"
 #include "editor.h"
 #include "quickpad.h"
 #include "resource.h"
@@ -220,8 +221,7 @@ static BOOL CreateHostWindow(HINSTANCE instance)
 
 /*
  * The host sleeps nearly all the time and has to answer at once when woken, so it asks Windows not to
- * treat it as background work: no power throttling (EcoQoS), a priority above normal, and a working set
- * Windows does not trim below 64 MB, which keeps its code and pooled windows in memory while idle.
+ * treat it as background work: no power throttling (EcoQoS) and a priority above normal.
  * Each request is a hint; a system that refuses one simply runs the host without it.
  */
 static void RequestResponsiveness(void)
@@ -232,8 +232,17 @@ static void RequestResponsiveness(void)
     throttling.StateMask = 0;
     SetProcessInformation(process, ProcessPowerThrottling, &throttling, sizeof throttling);
     SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS);
-    SetProcessWorkingSetSizeEx(process, 64 * 1024 * 1024, 1024 * 1024 * 1024,
-        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+}
+
+/*
+ * A working set Windows does not trim below 64 MB plus the ready memory, which keeps the code, the
+ * pooled windows and the blocks prepared for the next files in memory while the host is idle.
+ */
+static void KeepInMemory(void)
+{
+    SIZE_T minimum = 64 * 1024 * 1024 + BlockBudget();
+    SIZE_T maximum = minimum + 1024 * 1024 * 1024;
+    SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
 }
 
 int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, size_t count)
@@ -249,6 +258,7 @@ int HostRun(BOOL resident, HANDLE readyEvent, BOOL background, wchar_t **paths, 
     if (resident && CreateHostWindow(instance)) {
         hostReadyEvent = readyEvent;
         SetEvent(readyEvent);
+        KeepInMemory();
     } else {
         resident = FALSE;
     }
