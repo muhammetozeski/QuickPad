@@ -1,4 +1,5 @@
 #include "document.h"
+#include "blocks.h"
 #include "quickpad.h"
 
 #include <emmintrin.h>
@@ -7,9 +8,63 @@
 #define GAP_MINIMUM 4096
 #define LINE_RESERVE 256
 
+/* Text of this many units and up lives in a ready block; a line index of this many entries and up in its own pages. */
+#define BLOCK_UNITS (BLOCK_MINIMUM / 2 / sizeof(wchar_t))
+#define INDEX_BLOCK_ENTRIES (64 * 1024)
+#define PAGE 4096
+
 static size_t GapSize(const Document *document)
 {
     return document->gapEnd - document->gapStart;
+}
+
+static wchar_t *AllocText(size_t units, size_t *capacity, BOOL *isBlock)
+{
+    if (units >= BLOCK_UNITS) {
+        size_t bytes = 0;
+        wchar_t *text = BlockTake(units * sizeof(wchar_t), &bytes);
+        *capacity = bytes / sizeof(wchar_t);
+        *isBlock = TRUE;
+        return text;
+    }
+    *capacity = units;
+    *isBlock = FALSE;
+    return MemAlloc(units * sizeof(wchar_t));
+}
+
+static void FreeText(wchar_t *text, size_t capacity, BOOL isBlock)
+{
+    if (isBlock) {
+        BlockReturn(text, capacity * sizeof(wchar_t));
+    } else {
+        MemFree(text);
+    }
+}
+
+static size_t *AllocIndex(size_t entries, size_t *capacity, BOOL *isBlock)
+{
+    if (entries >= INDEX_BLOCK_ENTRIES) {
+        size_t bytes = (entries * sizeof(size_t) + PAGE - 1) & ~(size_t)(PAGE - 1);
+        size_t *starts = VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        *capacity = bytes / sizeof(size_t);
+        *isBlock = TRUE;
+        return starts;
+    }
+    *capacity = entries;
+    *isBlock = FALSE;
+    return MemAlloc(entries * sizeof(size_t));
+}
+
+static void FreeIndex(size_t *starts, BOOL isBlock)
+{
+    if (starts == NULL) {
+        return;
+    }
+    if (isBlock) {
+        VirtualFree(starts, 0, MEM_RELEASE);
+    } else {
+        MemFree(starts);
+    }
 }
 
 /* Index of the first ch at or after from, or length. */
@@ -93,6 +148,8 @@ BOOL DocumentInitialize(Document *document)
         MemFree(empty.lineStarts);
         return FALSE;
     }
+    empty.bufferIsBlock = FALSE;
+    empty.indexIsBlock = FALSE;
     empty.lineStarts[0] = 0;
     *document = empty;
     return TRUE;
@@ -100,10 +157,58 @@ BOOL DocumentInitialize(Document *document)
 
 void DocumentRelease(Document *document)
 {
-    MemFree(document->buffer);
-    MemFree(document->lineStarts);
+    DocumentFinishLoad(document);
+    FreeText(document->buffer, document->capacity, document->bufferIsBlock);
+    FreeIndex(document->lineStarts, document->indexIsBlock);
     Document empty = { 0 };
     *document = empty;
+}
+
+void DocumentAdoptLoad(Document *document, TextLoad *load)
+{
+    DocumentRelease(document);
+    document->buffer = load->text;
+    document->capacity = load->textCapacity;
+    document->bufferIsBlock = TRUE;
+    document->gapStart = load->length;
+    document->gapEnd = load->textCapacity;
+    document->lineStarts = load->lineStarts;
+    document->lineCapacity = load->lineCapacity;
+    document->indexIsBlock = TRUE;
+    document->lineCount = load->lineCount;
+    document->load = load;
+    if (TextLoadIsComplete(load)) {
+        DocumentFinishLoad(document);
+    }
+}
+
+void DocumentStartLoad(Document *document)
+{
+    if (document->load != NULL) {
+        TextLoadStart(document->load);
+    }
+}
+
+BOOL DocumentFinishLoad(Document *document)
+{
+    TextLoad *load = document->load;
+    if (load == NULL) {
+        return FALSE;
+    }
+    TextLoadWait(load);
+    document->gapStart = load->length;
+    document->lineCount = load->lineCount;
+    document->load = NULL;
+    TextLoadEnd(load);
+
+    /* The index was sized for a line per byte; the pages beyond the lines it got are given back. */
+    size_t keep = ((document->lineCount + LINE_RESERVE) * sizeof(size_t) + PAGE - 1) & ~(size_t)(PAGE - 1);
+    size_t have = document->lineCapacity * sizeof(size_t);
+    if (document->indexIsBlock && have > keep && have - keep >= BLOCK_MINIMUM) {
+        VirtualFree((unsigned char *)document->lineStarts + keep, have - keep, MEM_DECOMMIT);
+        document->lineCapacity = keep / sizeof(size_t);
+    }
+    return TRUE;
 }
 
 BOOL DocumentAdopt(Document *document, wchar_t *text, size_t length)
@@ -112,8 +217,9 @@ BOOL DocumentAdopt(Document *document, wchar_t *text, size_t length)
     length = DocumentNormalizeLineBreaks(text, length);
 
     size_t breaks = CountLineBreaks(text, length);
-    size_t lineCapacity = breaks + 1 + LINE_RESERVE;
-    size_t *starts = MemAlloc(lineCapacity * sizeof(size_t));
+    size_t lineCapacity = 0;
+    BOOL indexIsBlock = FALSE;
+    size_t *starts = AllocIndex(breaks + 1 + LINE_RESERVE, &lineCapacity, &indexIsBlock);
     if (starts == NULL) {
         return FALSE;
     }
@@ -137,15 +243,16 @@ BOOL DocumentAdopt(Document *document, wchar_t *text, size_t length)
         }
     }
 
-    MemFree(document->buffer);
-    MemFree(document->lineStarts);
+    DocumentRelease(document);
     document->buffer = text;
     document->capacity = capacity;
+    document->bufferIsBlock = FALSE;
     document->gapStart = length;
     document->gapEnd = capacity;
     document->lineStarts = starts;
     document->lineCount = line;
     document->lineCapacity = lineCapacity;
+    document->indexIsBlock = indexIsBlock;
     return TRUE;
 }
 
@@ -208,8 +315,9 @@ static BOOL EnsureGap(Document *document, size_t needed)
     }
 
     size_t length = DocumentLength(document);
-    size_t capacity = length + needed + GAP_MINIMUM + length / 8;
-    wchar_t *buffer = MemAlloc(capacity * sizeof(wchar_t));
+    size_t capacity = 0;
+    BOOL isBlock = FALSE;
+    wchar_t *buffer = AllocText(length + needed + GAP_MINIMUM + length / 8, &capacity, &isBlock);
     if (buffer == NULL) {
         return FALSE;
     }
@@ -217,8 +325,9 @@ static BOOL EnsureGap(Document *document, size_t needed)
     size_t after = document->capacity - document->gapEnd;
     memcpy(buffer, document->buffer, document->gapStart * sizeof(wchar_t));
     memcpy(buffer + capacity - after, document->buffer + document->gapEnd, after * sizeof(wchar_t));
-    MemFree(document->buffer);
+    FreeText(document->buffer, document->capacity, document->bufferIsBlock);
     document->buffer = buffer;
+    document->bufferIsBlock = isBlock;
     document->gapEnd = capacity - after;
     document->capacity = capacity;
     return TRUE;
@@ -230,15 +339,17 @@ static BOOL EnsureLineCapacity(Document *document, size_t lines)
         return TRUE;
     }
 
-    size_t capacity = lines + LINE_RESERVE + lines / 8;
-    size_t *starts = MemAlloc(capacity * sizeof(size_t));
+    size_t capacity = 0;
+    BOOL isBlock = FALSE;
+    size_t *starts = AllocIndex(lines + LINE_RESERVE + lines / 8, &capacity, &isBlock);
     if (starts == NULL) {
         return FALSE;
     }
     memcpy(starts, document->lineStarts, document->lineCount * sizeof(size_t));
-    MemFree(document->lineStarts);
+    FreeIndex(document->lineStarts, document->indexIsBlock);
     document->lineStarts = starts;
     document->lineCapacity = capacity;
+    document->indexIsBlock = isBlock;
     return TRUE;
 }
 

@@ -77,11 +77,35 @@ int wmain(void)
     CHECK(format.lineEnding == LINE_ENDING_LF, "large file line ending");
     MemFree(text);
 
+    TextLoad *load = NULL;
+    TextFormat loadFormat = TextDefaultFormat();
+    CHECK(FileBeginLoad(path, &loadFormat, NULL, 0, &load, &error), "large file begins loading");
+    if (load != NULL) {
+        CHECK(load->length > 0 && load->length < size && load->text[0] == L'a' && load->text[63] == L'\n', "the first part is decoded at once");
+        TextLoadStart(load);
+        TextLoadWait(load);
+        CHECK(load->length == size && load->lineCount == size / 64 + 1 && load->text[size - 1] == L'\n', "the whole file after waiting");
+        BOOL sameText = TRUE;
+        for (size_t i = 0; i < size && sameText; i += 4099) {
+            sameText = load->text[i] == (wchar_t)large[i];
+        }
+        CHECK(sameText, "the whole file matches the bytes on disk");
+        CHECK(loadFormat.lineEnding == LINE_ENDING_LF && loadFormat.encoding == TEXT_ENCODING_UTF8, "loaded file format");
+        TextLoadDiscard(load);
+    }
+    CHECK(!FileBeginLoad(L"C:\\QuickPad-no-such-file.txt", &loadFormat, NULL, 0, &load, &error) && error == ERROR_FILE_NOT_FOUND, "missing file does not begin loading");
+
     HANDLE writer = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     CHECK(writer != INVALID_HANDLE_VALUE, "open the file for writing");
     CHECK(FileLoad(path, &text, &length, &format, &error), "file open for writing elsewhere still loads");
     CHECK(length == size, "file open for writing elsewhere text");
     MemFree(text);
+    CHECK(FileBeginLoad(path, &loadFormat, NULL, 0, &load, &error), "file open for writing elsewhere still begins loading");
+    if (load != NULL) {
+        TextLoadWait(load);
+        CHECK(load->length == size, "file open for writing elsewhere loads whole");
+        TextLoadDiscard(load);
+    }
     CloseHandle(writer);
     DeleteFileW(path);
     MemFree(large);

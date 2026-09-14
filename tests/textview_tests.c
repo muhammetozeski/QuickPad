@@ -364,6 +364,67 @@ static void TestLargeText(void)
     CHECK(textLength == lines * (lineLength + 1) + 2 && content[0] == L'y' && content[textLength - 1] == L'z', "edits at both ends");
 }
 
+static void NoRelease(void *context)
+{
+    UNREFERENCED_PARAMETER(context);
+}
+
+/* A large file through a load: the view shows the first part at once and the rest when the workers are done. */
+static void TestLoad(void)
+{
+    size_t size = 3 * 1024 * 1024;
+    unsigned char *data = MemAlloc(size);
+    const char line[] = "sat\xC4\xB1r \xC3\xA7ok uzun de\xC4\x9Fil ama yeterli 0123456789\r\n";
+    for (size_t i = 0; i < size; ++i) {
+        data[i] = (unsigned char)line[i % (sizeof line - 1)];
+    }
+    TextFormat format = TextDefaultFormat();
+    TextLoad *load = TextLoadBegin(data, size, size, NULL, NoRelease, NULL, &format, view, WM_TEXTVIEW_LOAD_DONE);
+    CHECK(load != NULL, "load begins");
+    if (load == NULL) {
+        MemFree(data);
+        return;
+    }
+    /* Nothing happens in the background before the start, so the first part is all the view has. */
+    size_t provisionalLines = load->lineCount;
+    TextViewSetLoad(view, load);
+    CHECK(provisionalLines > 1 && TextViewLineCount(view) == provisionalLines && TextViewCaretPosition(view) == 0, "the view shows the first part");
+    SendMessageW(view, WM_PAINT, 0, 0);
+    CHECK(TextViewIsLoading(view) && TextViewLineCount(view) == provisionalLines, "painting does not wait for the rest");
+    TextViewStartLoad(view);
+
+    /* The worker posts WM_TEXTVIEW_LOAD_DONE; pumping until it arrives finishes the load without waiting for it. */
+    DWORD start = GetTickCount();
+    MSG message;
+    while (TextViewIsLoading(view) && GetTickCount() - start < 5000) {
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            DispatchMessageW(&message);
+        }
+        Sleep(1);
+    }
+    CHECK(!TextViewIsLoading(view), "the posted message finishes the load");
+    size_t expectedLines = size / (sizeof line - 1) + 1;
+    CHECK(TextViewLineCount(view) == expectedLines && expectedLines > provisionalLines, "line count is final");
+    size_t length = 0;
+    const wchar_t *text = TextViewGetText(view, &length);
+    CHECK(text[0] == L's' && text[3] == 0x131 && text[length - 1] == L'\n', "decoded text");
+    CHECK(format.encoding == TEXT_ENCODING_UTF8 && format.lineEnding == LINE_ENDING_CRLF, "format");
+
+    /* Typing before the load is done waits for it and edits the final text. */
+    load = TextLoadBegin(data, size, size, NULL, NoRelease, NULL, &format, view, WM_TEXTVIEW_LOAD_DONE);
+    TextViewSetLoad(view, load);
+    Key(VK_END, FALSE, TRUE);
+    CHECK(!TextViewIsLoading(view) && TextViewCaretPosition(view) == length, "a key waits for the load and sees the whole text");
+    Type(L"z");
+    const wchar_t *edited = TextViewGetText(view, &length);
+    CHECK(edited[length - 1] == L'z', "the edit lands at the end of the whole text");
+    while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+        DispatchMessageW(&message);
+    }
+    Load(L"");
+    MemFree(data);
+}
+
 int wmain(void)
 {
     HINSTANCE instance = GetModuleHandleW(NULL);
@@ -402,6 +463,7 @@ int wmain(void)
     TestPaint();
     TestEditorOperations();
     TestLargeText();
+    TestLoad();
 
     DestroyWindow(parent);
     DeleteObject(font);

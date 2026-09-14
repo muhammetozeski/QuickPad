@@ -128,14 +128,17 @@ if ($Test) {
     )
 
     # Each test program and the sources it tests.
+    $loading = @('textload.c', 'text.c', 'workers.c', 'blocks.c')
     $unitTests = [ordered]@{
         'text_tests'     = @('text.c')
-        'document_tests' = @('document.c')
+        'workers_tests'  = @('workers.c', 'blocks.c')
+        'textload_tests' = @('document.c') + $loading
+        'document_tests' = @('document.c') + $loading
         'layout_tests'   = @('layout.c')
-        'history_tests'  = @('history.c', 'document.c')
+        'history_tests'  = @('history.c', 'document.c') + $loading
         'search_tests'   = @('search.c')
-        'textview_tests' = @('textview.c', 'document.c', 'history.c', 'layout.c', 'search.c')
-        'fileio_tests'   = @('fileio.c', 'text.c')
+        'textview_tests' = @('textview.c', 'document.c', 'history.c', 'layout.c', 'search.c') + $loading
+        'fileio_tests'   = @('fileio.c') + $loading
     }
     foreach ($name in $unitTests.Keys) {
         $testSources = @("$root\tests\$name.c") + ($unitTests[$name] | ForEach-Object { "$root\src\$_" })

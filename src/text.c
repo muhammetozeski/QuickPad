@@ -13,7 +13,7 @@ TextFormat TextDefaultFormat(void)
 }
 
 /* Text without a byte order mark counts as UTF-16 when most units of a sample have a zero byte on the same side. */
-static BOOL LooksLikeUtf16(const unsigned char *data, size_t size, TextEncoding *encoding)
+BOOL TextLooksLikeUtf16(const unsigned char *data, size_t size, TextEncoding *encoding)
 {
     size_t sample = (size < 4096 ? size : 4096) & ~(size_t)1;
     size_t units = sample / 2;
@@ -40,7 +40,7 @@ static BOOL LooksLikeUtf16(const unsigned char *data, size_t size, TextEncoding 
 }
 
 /* Number of bytes at the end that start a UTF-8 sequence the file does not complete. */
-static size_t TrailingIncompleteUtf8(const unsigned char *data, size_t size)
+size_t TextTrailingIncompleteUtf8(const unsigned char *data, size_t size)
 {
     for (size_t back = 1; back <= 3 && back <= size; ++back) {
         unsigned char c = data[size - back];
@@ -169,11 +169,11 @@ wchar_t *TextDecode(const unsigned char *data, size_t size, TextFormat *format, 
         detected.encoding = TEXT_ENCODING_UTF16BE;
         detected.byteOrderMark = TRUE;
         text = DecodeUtf16(data + 2, size - 2, TRUE, &count);
-    } else if (LooksLikeUtf16(data, size, &utf16)) {
+    } else if (TextLooksLikeUtf16(data, size, &utf16)) {
         detected.encoding = utf16;
         text = DecodeUtf16(data, size, utf16 == TEXT_ENCODING_UTF16BE, &count);
     } else {
-        size_t incomplete = TrailingIncompleteUtf8(data, size);
+        size_t incomplete = TextTrailingIncompleteUtf8(data, size);
         SetLastError(ERROR_SUCCESS);
         text = DecodeMultiByte(CP_UTF8, MB_ERR_INVALID_CHARS, data, size - incomplete, &count);
         BOOL valid = text != NULL;

@@ -3,6 +3,7 @@
 #include "history.h"
 #include "layout.h"
 #include "quickpad.h"
+#include "trace.h"
 
 #include <imm.h>
 #include <limits.h>
@@ -161,6 +162,24 @@ static void NotifySelection(TextView *view)
         if (parent != NULL) {
             SendMessageW(parent, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(view->window), TEXTVIEW_SELECTION_CHANGED), (LPARAM)view->window);
         }
+    }
+}
+
+/* Forward declarations for the load completion. */
+static void Redraw(TextView *view);
+
+/*
+ * Waits for the rest of a file still being decoded, then shows the whole text. Called before every
+ * operation that could touch text beyond the part decoded so far.
+ */
+static void EnsureLoaded(TextView *view)
+{
+    if (view->document.load != NULL) {
+        TRACE("EnsureLoaded");
+        DocumentFinishLoad(&view->document);
+        TRACE("load finished");
+        Redraw(view);
+        NotifySelection(view);
     }
 }
 
@@ -446,6 +465,10 @@ static void ScrollToCaret(TextView *view)
 
 static void UpdateScrollBars(TextView *view)
 {
+    /* While a file is still being decoded the line count is not final; the bars are set once it is. */
+    if (view->document.load != NULL) {
+        return;
+    }
     size_t lineCount = DocumentLineCount(&view->document);
     SCROLLINFO info = { sizeof info };
     info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
@@ -1317,9 +1340,42 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
         return DefWindowProcW(window, message, wParam, lParam);
     }
 
+    if (view->document.load != NULL) {
+        /* Painting and the window plumbing only read what is decoded; input and text requests wait for the rest. */
+        switch (message) {
+        case WM_KEYDOWN:
+        case WM_CHAR:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN:
+        case WM_CONTEXTMENU:
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_VSCROLL:
+        case WM_HSCROLL:
+        case WM_TIMER:
+        case WM_GETTEXT:
+        case WM_GETTEXTLENGTH:
+        case WM_IME_STARTCOMPOSITION:
+        case EM_GETSEL:
+        case EM_SETSEL:
+        case WM_TEXTVIEW_LOAD_DONE:
+            EnsureLoaded(view);
+            break;
+        case WM_MOUSEMOVE:
+            if (view->selecting) {
+                EnsureLoaded(view);
+            }
+            break;
+        }
+    }
+
     switch (message) {
     case WM_CREATE:
         ApplyFont(view, (HFONT)GetStockObject(SYSTEM_FIXED_FONT));
+        return 0;
+
+    case WM_TEXTVIEW_LOAD_DONE:
         return 0;
 
     case WM_NCDESTROY:
@@ -1337,9 +1393,11 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
     case WM_PAINT: {
         long long widest = view->widestRow;
         PAINTSTRUCT paint;
+        TRACE("WM_PAINT");
         HDC dc = BeginPaint(window, &paint);
         PaintArea(view, dc, &paint.rcPaint);
         EndPaint(window, &paint);
+        TRACE("painted");
         if (view->widestRow != widest && !view->wordWrap) {
             UpdateScrollBars(view);
         }
@@ -1361,14 +1419,19 @@ static LRESULT CALLBACK TextViewProc(HWND window, UINT message, WPARAM wParam, L
         CreateCaret(window, NULL, CaretWidth(), view->lineHeight);
         UpdateCaret(view);
         ShowCaret(window);
-        InvalidateRect(window, NULL, FALSE);
+        /* Focus only changes the colors of selected text. */
+        if (view->anchor != view->caret) {
+            InvalidateRect(window, NULL, FALSE);
+        }
         return 0;
 
     case WM_KILLFOCUS:
         view->focused = FALSE;
         HideCaret(window);
         DestroyCaret();
-        InvalidateRect(window, NULL, FALSE);
+        if (view->anchor != view->caret) {
+            InvalidateRect(window, NULL, FALSE);
+        }
         return 0;
 
     case WM_SETCURSOR:
@@ -1615,6 +1678,23 @@ BOOL TextViewSetText(HWND window, wchar_t *text, size_t length)
     return TRUE;
 }
 
+void TextViewSetLoad(HWND window, TextLoad *load)
+{
+    TextView *view = ViewFrom(window);
+    DocumentAdoptLoad(&view->document, load);
+    ResetView(view);
+}
+
+void TextViewStartLoad(HWND window)
+{
+    DocumentStartLoad(&ViewFrom(window)->document);
+}
+
+BOOL TextViewIsLoading(HWND window)
+{
+    return ViewFrom(window)->document.load != NULL;
+}
+
 void TextViewClear(HWND window)
 {
     TextView *view = ViewFrom(window);
@@ -1631,6 +1711,7 @@ void TextViewClear(HWND window)
 const wchar_t *TextViewGetText(HWND window, size_t *length)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     *length = DocumentLength(&view->document);
     return DocumentText(&view->document);
 }
@@ -1677,6 +1758,7 @@ void TextViewGetSelection(HWND window, size_t *start, size_t *end)
 void TextViewSetSelection(HWND window, size_t anchor, size_t caret)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t length = DocumentLength(&view->document);
     view->anchor = anchor > length ? length : anchor;
     MoveCaret(view, caret, TRUE, FALSE, FALSE);
@@ -1696,6 +1778,7 @@ size_t TextViewCaretLine(HWND window)
 void TextViewGoToLine(HWND window, size_t line)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t lineCount = DocumentLineCount(&view->document);
     MoveCaret(view, DocumentLineStart(&view->document, line < lineCount ? line : lineCount - 1), FALSE, FALSE, FALSE);
 }
@@ -1730,6 +1813,7 @@ static void AfterHistoryStep(TextView *view, size_t anchor, size_t caret)
 void TextViewUndo(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t anchor = 0;
     size_t caret = 0;
     if (HistoryUndo(&view->history, &view->document, &anchor, &caret)) {
@@ -1740,6 +1824,7 @@ void TextViewUndo(HWND window)
 void TextViewRedo(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t anchor = 0;
     size_t caret = 0;
     if (HistoryRedo(&view->history, &view->document, &anchor, &caret)) {
@@ -1750,6 +1835,7 @@ void TextViewRedo(HWND window)
 void TextViewCopy(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t start;
     size_t end;
     Selection(view, &start, &end);
@@ -1800,6 +1886,7 @@ void TextViewCut(HWND window)
 void TextViewPaste(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(window)) {
         return;
     }
@@ -1833,6 +1920,7 @@ void TextViewPaste(HWND window)
 void TextViewDeleteSelection(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t start;
     size_t end;
     Selection(view, &start, &end);
@@ -1844,6 +1932,7 @@ void TextViewDeleteSelection(HWND window)
 void TextViewSelectAll(HWND window)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     view->anchor = 0;
     view->caret = DocumentLength(&view->document);
     view->caretTrailing = FALSE;
@@ -1856,6 +1945,7 @@ void TextViewSelectAll(HWND window)
 BOOL TextViewFind(HWND window, const wchar_t *pattern, SearchOptions options, BOOL down)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t length = DocumentLength(&view->document);
     const wchar_t *text = DocumentText(&view->document);
     size_t patternLength = (size_t)lstrlenW(pattern);
@@ -1874,6 +1964,7 @@ BOOL TextViewFind(HWND window, const wchar_t *pattern, SearchOptions options, BO
 BOOL TextViewReplace(HWND window, const wchar_t *pattern, const wchar_t *with, SearchOptions options)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t patternLength = (size_t)lstrlenW(pattern);
     size_t start;
     size_t end;
@@ -1890,6 +1981,7 @@ BOOL TextViewReplace(HWND window, const wchar_t *pattern, const wchar_t *with, S
 BOOL TextViewReplaceRange(HWND window, size_t start, size_t end, const wchar_t *text, size_t length)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t documentLength = DocumentLength(&view->document);
     end = end < documentLength ? end : documentLength;
     start = start < end ? start : end;
@@ -1898,17 +1990,23 @@ BOOL TextViewReplaceRange(HWND window, size_t start, size_t end, const wchar_t *
 
 size_t TextViewLineStart(HWND window, size_t line)
 {
-    return DocumentLineStart(&ViewFrom(window)->document, line);
+    TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
+    return DocumentLineStart(&view->document, line);
 }
 
 size_t TextViewLineEnd(HWND window, size_t line)
 {
-    return DocumentLineEnd(&ViewFrom(window)->document, line);
+    TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
+    return DocumentLineEnd(&view->document, line);
 }
 
 size_t TextViewLineFromPosition(HWND window, size_t position)
 {
-    return DocumentLineFromPosition(&ViewFrom(window)->document, position);
+    TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
+    return DocumentLineFromPosition(&view->document, position);
 }
 
 size_t TextViewCaretPosition(HWND window)
@@ -1939,6 +2037,7 @@ void TextViewNotifySelection(HWND window, BOOL notify)
 size_t TextViewReplaceAll(HWND window, const wchar_t *pattern, const wchar_t *with, SearchOptions options)
 {
     TextView *view = ViewFrom(window);
+    EnsureLoaded(view);
     size_t length = DocumentLength(&view->document);
     const wchar_t *text = DocumentText(&view->document);
     if (text == NULL) {

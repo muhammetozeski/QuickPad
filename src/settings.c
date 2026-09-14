@@ -92,6 +92,7 @@ void SettingsLoad(void)
     settings.tabSize = ReadNumber(section, L"TabSize", SETTINGS_TAB_SIZE_DEFAULT, 1, 16);
     settings.autoIndent = ReadNumber(section, L"AutoIndent", 0, 0, 1);
     settings.statusBar = ReadNumber(section, L"StatusBar", 0, 0, 1);
+    settings.readyMemoryMB = ReadNumber(section, L"ReadyMemoryMB", SETTINGS_READY_MEMORY_DEFAULT, 0, SETTINGS_READY_MEMORY_MAX);
     const wchar_t *fontName = FindValue(section, L"FontName");
     lstrcpynW(settings.fontName, fontName != NULL && *fontName != 0 ? fontName : SETTINGS_FONT_NAME_DEFAULT,
         ARRAYSIZE(settings.fontName));
@@ -140,6 +141,7 @@ void SettingsSave(void)
     AddNumber(section, &length, L"TabSize", settings.tabSize);
     AddNumber(section, &length, L"AutoIndent", settings.autoIndent);
     AddNumber(section, &length, L"StatusBar", settings.statusBar);
+    AddNumber(section, &length, L"ReadyMemoryMB", settings.readyMemoryMB);
     section[length] = 0;
     WritePrivateProfileSectionW(SECTION, section, path);
     MemFree(section);

@@ -15,7 +15,11 @@ typedef struct Settings {
     int tabSize;
     BOOL autoIndent;
     BOOL statusBar;
+    int readyMemoryMB;      /* memory kept mapped and ready for the text of the next files */
 } Settings;
+
+#define SETTINGS_READY_MEMORY_DEFAULT 128
+#define SETTINGS_READY_MEMORY_MAX 16384
 
 #define SETTINGS_POOL_SIZE_DEFAULT 30
 #define SETTINGS_POOL_SIZE_MAX 100

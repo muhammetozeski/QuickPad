@@ -3,16 +3,21 @@
 #include <windows.h>
 
 #include "search.h"
+#include "textload.h"
 
 /*
  * A plain text editing control. It keeps the text in a Document and draws only the rows that are
- * on screen, so the cost of opening a file is reading it and finding its line breaks.
+ * on screen, so the cost of opening a file is decoding its first part; the rest is decoded by the
+ * worker threads while the window is already showing it.
  * The parent receives WM_COMMAND with EN_CHANGE whenever the text changes.
  */
 #define TEXTVIEW_CLASS L"QuickPadTextView"
 
 /* WM_COMMAND notification code; see TextViewNotifySelection. */
 #define TEXTVIEW_SELECTION_CHANGED 0x0701
+
+/* Posted to the view by the worker that decodes the last part of a load; see TextViewSetLoad. */
+#define WM_TEXTVIEW_LOAD_DONE (WM_APP + 0x40)
 
 typedef struct TextViewColors {
     COLORREF text;
@@ -30,6 +35,20 @@ void TextViewSetColors(HWND view, const TextViewColors *colors);
 
 /* Takes over text, a MemAlloc block; clears undo and puts the caret at the start. */
 BOOL TextViewSetText(HWND view, wchar_t *text, size_t length);
+
+/*
+ * Takes over a load begun with the view as its notify window and WM_TEXTVIEW_LOAD_DONE as its
+ * message. The view shows what is decoded at once and finishes the load before anything else
+ * touches the text.
+ */
+void TextViewSetLoad(HWND view, TextLoad *load);
+
+/* Hands the rest of the load to the worker threads, once the window is on screen. */
+void TextViewStartLoad(HWND view);
+
+/* TRUE while a load is still being decoded. */
+BOOL TextViewIsLoading(HWND view);
+
 void TextViewClear(HWND view);
 
 /* The whole text with L'\n' line breaks, null-terminated, valid until the text changes. */
